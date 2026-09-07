@@ -1,6 +1,7 @@
 import { config } from "./config.js";
 import { ConversationMemory } from "./memory.js";
 import { DeepSeekClient } from "./deepseek.js";
+import { QgentStore } from "./storage.js";
 import { startHealthServer } from "./health.js";
 import { createQQBot } from "./qqbot.js";
 
@@ -14,7 +15,8 @@ const state = {
 };
 
 const memory = new ConversationMemory(config.memory);
-const ai = new DeepSeekClient(config.deepseek);
+const store = new QgentStore(config.storage);
+const ai = new DeepSeekClient({ ...config.deepseek, store });
 const bot = createQQBot({ qqConfig: config.qq, ai, memory, state });
 
 const healthServer = startHealthServer({
@@ -24,6 +26,7 @@ const healthServer = startHealthServer({
     ready: state.ready,
     model: config.deepseek.model,
     activeConversations: memory.size,
+    persistentStorage: true,
     ...state,
   }),
 });
@@ -38,6 +41,7 @@ async function shutdown(signal) {
   state.ready = false;
   abortController.abort();
   healthServer.close();
+  store.close();
 }
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
@@ -56,4 +60,5 @@ try {
 } finally {
   clearInterval(cleanupTimer);
   healthServer.close();
+  store.close();
 }

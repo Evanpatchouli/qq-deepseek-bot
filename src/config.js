@@ -33,9 +33,15 @@ export const config = {
     timeoutMs: int("AI_TIMEOUT_MS", 45_000),
     webSearchEnabled: bool("DEEPSEEK_WEB_SEARCH", true),
     defaultLocation: process.env.QGENT_DEFAULT_LOCATION?.trim() || "",
+    timeZone: process.env.QGENT_TIMEZONE?.trim() || "Asia/Shanghai",
+    maxToolRounds: int("QGENT_MAX_TOOL_ROUNDS", 5),
     systemPrompt:
       process.env.SYSTEM_PROMPT?.trim() ||
       "你叫 Qgent，是一个运行在 QQ 中的个人 AI 小助手。请使用简体中文，回答准确、自然、简洁。",
+  },
+  storage: {
+    dbPath: process.env.QGENT_DB_PATH?.trim() || "./data/qgent.db",
+    timeZone: process.env.QGENT_TIMEZONE?.trim() || "Asia/Shanghai",
   },
   memory: {
     maxTurns: int("MAX_HISTORY_TURNS", 8),

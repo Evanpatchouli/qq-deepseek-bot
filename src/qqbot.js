@@ -52,7 +52,6 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
     markdownSupport: false,
   });
 
-  // 官方中间件：过滤机器人自己的回声、做短窗口去重、清理 @ 标记。
   bot.use(messageFilter({ skipSelfEcho: true, dedup: { windowMs: 5000 } }));
   bot.use(contentSanitizer({ stripBotMention: true }));
   bot.use(mentionGate({ requireMentionInGroup: qqConfig.groupRequireMention }));
@@ -81,7 +80,7 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
 
     if (text === "/reset") {
       memory.clear(key);
-      await sendReply(bot, qqConfig, msg, "已清空这段对话的上下文。");
+      await sendReply(bot, qqConfig, msg, "这段聊天上下文清空啦。持久化的笔记、账本和小确幸不会被删掉喔。");
       return;
     }
 
@@ -90,7 +89,7 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
         bot,
         qqConfig,
         msg,
-        "我是 DeepSeek AI 助手。直接发消息即可聊天；发送 /reset 可清空当前会话记忆。",
+        "我是 Qgent ✨ 可以陪你聊天、联网查实时信息，也能真正保存笔记、记账和小确幸。比如：‘午饭 28 元记餐饮’、‘记个笔记：周五交电费’、‘记录今天的小确幸：下班看到了超漂亮的晚霞’。发送 /reset 只清空临时聊天上下文，不会删除已保存记录。",
       );
       return;
     }
@@ -102,7 +101,11 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
       }
 
       const history = memory.get(key);
-      const answer = await ai.chat({ history, prompt: text });
+      const answer = await ai.chat({
+        history,
+        prompt: text,
+        userId: msg.senderId,
+      });
       await sendReply(bot, qqConfig, msg, answer);
       memory.appendTurn(key, text, answer);
 
@@ -115,7 +118,7 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
       state.lastError = String(error?.stack || error);
       console.error("[message] failed", error);
       try {
-        await sendReply(bot, qqConfig, msg, "AI 暂时开小差了，请稍后再试一次。");
+        await sendReply(bot, qqConfig, msg, "唔，Qgent 刚刚卡了一下，请稍后再试一次。");
       } catch (replyError) {
         console.error("[message] fallback reply failed", replyError);
       }
