@@ -1,0 +1,18 @@
+{
+  "name": "qq-deepseek-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "QQ Open Platform AI bot backend powered by DeepSeek",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file=.env src/index.js",
+    "start": "node --env-file=.env src/index.js"
+  },
+  "dependencies": {
+    "@tencent-connect/qqbot-nodejs": "1.0.4",
+    "openai": "7.10.0"
+  }
+}
