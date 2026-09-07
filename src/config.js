@@ -31,9 +31,11 @@ export const config = {
     baseURL: process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com",
     model: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-v4-flash",
     timeoutMs: int("AI_TIMEOUT_MS", 45_000),
+    webSearchEnabled: bool("DEEPSEEK_WEB_SEARCH", true),
+    defaultLocation: process.env.QGENT_DEFAULT_LOCATION?.trim() || "",
     systemPrompt:
       process.env.SYSTEM_PROMPT?.trim() ||
-      "你是一个运行在 QQ 中的 AI 助手。请使用简体中文，回答准确、自然、简洁。",
+      "你叫 Qgent，是一个运行在 QQ 中的个人 AI 小助手。请使用简体中文，回答准确、自然、简洁。",
   },
   memory: {
     maxTurns: int("MAX_HISTORY_TURNS", 8),
