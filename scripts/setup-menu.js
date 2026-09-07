@@ -87,7 +87,9 @@ try {
     accessToken,
     "PUT",
     "/v2/menu",
-    menu,
+    {
+      menu,
+    },
   );
 
   console.log("✅ Qgent 自定义菜单配置成功！");
