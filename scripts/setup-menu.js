@@ -12,11 +12,7 @@ if (!appId || !appSecret) {
 
 const tokenManager = new TokenManager();
 const api = new ApiClient();
-
-const accessToken = await tokenManager.getAccessToken(
-  appId,
-  appSecret,
-);
+const accessToken = await tokenManager.getAccessToken(appId, appSecret);
 
 const menu = {
   items: [
@@ -25,7 +21,6 @@ const menu = {
       name: "聊聊",
       send_message: "陪我聊聊天吧",
     },
-
     {
       type: "menu",
       name: "生活",
@@ -57,11 +52,15 @@ const menu = {
         },
       ],
     },
-
     {
       type: "menu",
       name: "更多",
       sub_menu_items: [
+        {
+          type: "send_message",
+          name: "余额查询",
+          send_message: "/balance",
+        },
         {
           type: "send_message",
           name: "调查",
@@ -83,15 +82,7 @@ const menu = {
 };
 
 try {
-  const result = await api.request(
-    accessToken,
-    "PUT",
-    "/v2/menu",
-    {
-      menu,
-    },
-  );
-
+  const result = await api.request(accessToken, "PUT", "/v2/menu", { menu });
   console.log("✅ Qgent 自定义菜单配置成功！");
   console.log(result);
 } catch (error) {

@@ -22,6 +22,7 @@
   - 生活小确幸
   - 查询小确幸
 - QQ 单聊自定义菜单
+- QQ 私聊 `/balance` 查询 DeepSeek API 余额
 - `/reset` 清空当前用户临时会话上下文
 - `/help` 查看帮助
 - QQ 消息去重、自回声过滤
@@ -68,6 +69,10 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 # 联网搜索
 DEEPSEEK_WEB_SEARCH=true
 
+# DeepSeek 余额查询（建议保持官方地址）
+DEEPSEEK_BALANCE_BASE_URL=https://api.deepseek.com
+DEEPSEEK_BALANCE_TIMEOUT_MS=10000
+
 # AI 行为
 SYSTEM_PROMPT=你的 Qgent System Prompt
 MAX_HISTORY_TURNS=8
@@ -79,6 +84,9 @@ QGENT_DEFAULT_LOCATION=
 QGENT_TIMEZONE=Asia/Shanghai
 QGENT_DB_PATH=/app/data/qgent.db
 QGENT_MAX_TOOL_ROUNDS=5
+
+# 可选：允许查询余额的 QQ C2C OpenID，多个 OpenID 用英文逗号分隔
+QGENT_BALANCE_ALLOWED_OPENIDS=
 
 # 群聊仅在 @机器人 时回复
 GROUP_REQUIRE_MENTION=true
@@ -120,6 +128,12 @@ npm start
 npm run dev
 ```
 
+运行单元测试：
+
+```bash
+npm test
+```
+
 启动成功后应看到类似：
 
 ```text
@@ -133,6 +147,7 @@ npm run dev
 - 群聊机器人：默认需要 `@机器人` 后提问
 - `/reset`：清空当前临时会话上下文
 - `/help`：查看帮助
+- `/balance`：私聊查询 DeepSeek API 余额
 
 ---
 
@@ -342,9 +357,40 @@ Qgent 当前支持本地 SQLite 持久化生活数据。
 
 所有持久化数据都会按 QQ 用户进行隔离。
 
+## 9. DeepSeek 余额查询
+
+Qgent 可以在 QQ C2C 私聊中直接调用 DeepSeek 官方余额接口查询账户余额，不经过聊天模型，也不会消耗聊天 token：
+
+```text
+/balance
+```
+
+QQ 单聊自定义菜单中的“更多 → 余额查询”也会发送同一命令。群聊、频道和频道私信不会返回余额数据。
+
+余额接口默认使用 `https://api.deepseek.com`，可通过以下配置调整超时时间和接口地址：
+
+```env
+DEEPSEEK_BALANCE_BASE_URL=https://api.deepseek.com
+DEEPSEEK_BALANCE_TIMEOUT_MS=10000
+```
+
+余额属于账户敏感信息，建议配置 C2C OpenID 白名单：
+
+```env
+QGENT_BALANCE_ALLOWED_OPENIDS=你的QQ_C2C_OpenID
+```
+
+多个 OpenID 使用英文逗号分隔。留空时，为方便个人部署，任何能私聊机器人的用户都可以执行 `/balance`；启动时会输出安全提示。OpenID 可以从机器人日志中的以下字段找到：
+
+```text
+[message] kind=c2c sender=xxxxxxxx
+```
+
+如果查询失败，Qgent 会返回简短错误提示，不会把 API Key 或服务端堆栈发送给用户。
+
 ---
 
-## 9. Qgent System Prompt
+## 10. Qgent System Prompt
 
 推荐给 Qgent 设置稳定的人格：
 
@@ -370,7 +416,7 @@ SYSTEM_PROMPT=你叫 Qgent，是一个生活在 QQ 里的个人 AI 小助手…�
 
 ---
 
-## 10. QQ 自定义菜单
+## 11. QQ 自定义菜单
 
 项目支持通过 QQ OpenAPI 配置机器人单聊自定义菜单。
 
@@ -427,6 +473,7 @@ chmod +x setup-menu.sh
 └─ 小确幸
 
 更多
+├─ 余额查询
 ├─ 调查
 ├─ 清空对话
 └─ 帮助
@@ -438,7 +485,7 @@ chmod +x setup-menu.sh
 
 ---
 
-## 11. Docker 镜像注意事项
+## 12. Docker 镜像注意事项
 
 如果需要在容器内运行菜单配置脚本，Dockerfile 必须把 `scripts` 目录复制进去：
 
@@ -473,7 +520,7 @@ Cannot find module '/app/scripts/setup-menu.js'
 
 ---
 
-## 12. QQ 开放平台注意事项
+## 13. QQ 开放平台注意事项
 
 1. 确保机器人已开通实际使用场景对应的消息能力和事件权限。
 2. `AppSecret` 和 `DeepSeek API Key` 只放服务器环境变量，不要放前端。
@@ -485,7 +532,7 @@ Cannot find module '/app/scripts/setup-menu.js'
 
 ---
 
-## 13. 项目结构
+## 14. 项目结构
 
 当前主要目录：
 
@@ -496,6 +543,7 @@ qq-deepseek-bot/
 ├── scripts/
 │   └── setup-menu.js
 ├── src/
+│   ├── balance.js
 │   ├── index.js
 │   ├── config.js
 │   ├── qqbot.js
@@ -504,6 +552,8 @@ qq-deepseek-bot/
 │   ├── health.js
 │   ├── storage.js
 │   └── tools.js
+├── test/
+│   └── balance.test.js
 ├── .env.example
 ├── .gitignore
 ├── Dockerfile
@@ -517,7 +567,7 @@ qq-deepseek-bot/
 
 ---
 
-## 14. 日志
+## 15. 日志
 
 常见日志：
 
@@ -545,6 +595,12 @@ qq-deepseek-bot/
 [tool] user=xxxx name=qgent_add_ledger success=true
 ```
 
+### 余额查询
+
+```text
+[balance] sender=xxxx success=true
+```
+
 ### 健康检查
 
 ```text
@@ -553,7 +609,7 @@ qq-deepseek-bot/
 
 ---
 
-## 15. 生产化建议
+## 16. 生产化建议
 
 个人单机部署可以直接使用当前版本。
 
@@ -574,7 +630,7 @@ qq-deepseek-bot/
 
 ---
 
-## 16. 安全建议
+## 17. 安全建议
 
 - 不要提交 `.env`
 - 不要提交真实 API Key

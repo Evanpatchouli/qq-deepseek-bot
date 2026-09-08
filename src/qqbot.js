@@ -4,6 +4,7 @@ import {
   mentionGate,
   messageFilter,
 } from "@tencent-connect/qqbot-nodejs";
+import { formatDeepSeekBalance } from "./balance.js";
 
 function conversationKey(msg) {
   if (msg.kind === "c2c") return `c2c:${msg.senderId}`;
@@ -44,13 +45,25 @@ async function sendReply(bot, qqConfig, msg, content) {
   throw new Error(`Unsupported QQ message kind: ${msg.kind}`);
 }
 
-export function createQQBot({ qqConfig, ai, memory, state }) {
+function balanceAuthorized(qqConfig, msg) {
+  if (msg.kind !== "c2c") return false;
+  const allowed = qqConfig.balanceAllowedOpenIds || [];
+  return allowed.length === 0 || allowed.includes(msg.senderId);
+}
+
+export function createQQBot({ qqConfig, ai, balance, memory, state }) {
   const bot = new QQBot({
     appId: qqConfig.appId,
     appSecret: qqConfig.appSecret,
     logger: console,
     markdownSupport: false,
   });
+
+  if ((qqConfig.balanceAllowedOpenIds || []).length === 0) {
+    console.warn(
+      "[security] QGENT_BALANCE_ALLOWED_OPENIDS is empty; /balance is available to any C2C user",
+    );
+  }
 
   bot.use(messageFilter({ skipSelfEcho: true, dedup: { windowMs: 5000 } }));
   bot.use(contentSanitizer({ stripBotMention: true }));
@@ -89,8 +102,37 @@ export function createQQBot({ qqConfig, ai, memory, state }) {
         bot,
         qqConfig,
         msg,
-        "我是 Qgent ✨ 可以陪你聊天、联网查实时信息，也能真正保存笔记、记账和小确幸。比如：‘午饭 28 元记餐饮’、‘记个笔记：周五交电费’、‘记录今天的小确幸：下班看到了超漂亮的晚霞’。发送 /reset 只清空临时聊天上下文，不会删除已保存记录。",
+        "我是 Qgent ✨ 可以陪你聊天、联网查实时信息，也能真正保存笔记、记账和小确幸。私聊发送 /balance 可以查询 DeepSeek API 余额；/reset 只清空临时聊天上下文。",
       );
+      return;
+    }
+
+    if (text === "/balance" || text === "余额查询") {
+      if (msg.kind !== "c2c") {
+        await sendReply(bot, qqConfig, msg, "余额属于账户信息，这个功能只在私聊里开放喔。");
+        return;
+      }
+
+      if (!balanceAuthorized(qqConfig, msg)) {
+        console.warn(`[balance] unauthorized sender=${msg.senderId}`);
+        await sendReply(bot, qqConfig, msg, "哼，这个可是主人的小金库信息，只给主人看～");
+        return;
+      }
+
+      try {
+        const data = await balance.getBalance();
+        const content = formatDeepSeekBalance(data);
+        await sendReply(bot, qqConfig, msg, content);
+        console.log(`[balance] sender=${msg.senderId} success=true`);
+      } catch (error) {
+        console.error("[balance] failed", error);
+        await sendReply(
+          bot,
+          qqConfig,
+          msg,
+          `余额暂时没查到：${error?.message || "未知错误"}`,
+        );
+      }
       return;
     }
 

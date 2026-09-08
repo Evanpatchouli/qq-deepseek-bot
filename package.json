@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "node --watch --env-file=.env src/index.js",
     "start": "node --env-file=.env src/index.js",
-    "menu:setup": "node scripts/setup-menu.js"
+    "menu:setup": "node scripts/setup-menu.js",
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "@tencent-connect/qqbot-nodejs": "1.0.4",

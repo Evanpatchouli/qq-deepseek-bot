@@ -20,17 +20,30 @@ function bool(name, fallback) {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
+function csv(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   qq: {
     appId: required("QQBOT_APP_ID"),
     appSecret: required("QQBOT_APP_SECRET"),
     groupRequireMention: bool("GROUP_REQUIRE_MENTION", true),
+    balanceAllowedOpenIds: csv("QGENT_BALANCE_ALLOWED_OPENIDS"),
   },
   deepseek: {
     apiKey: required("DEEPSEEK_API_KEY"),
     baseURL: process.env.DEEPSEEK_BASE_URL?.trim() || "https://api.deepseek.com",
+    balanceBaseURL:
+      process.env.DEEPSEEK_BALANCE_BASE_URL?.trim() || "https://api.deepseek.com",
     model: process.env.DEEPSEEK_MODEL?.trim() || "deepseek-v4-flash",
     timeoutMs: int("AI_TIMEOUT_MS", 45_000),
+    balanceTimeoutMs: int("DEEPSEEK_BALANCE_TIMEOUT_MS", 10_000),
     webSearchEnabled: bool("DEEPSEEK_WEB_SEARCH", true),
     defaultLocation: process.env.QGENT_DEFAULT_LOCATION?.trim() || "",
     timeZone: process.env.QGENT_TIMEZONE?.trim() || "Asia/Shanghai",
