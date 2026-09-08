@@ -68,7 +68,23 @@ export class QgentStore {
 
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.db = new DatabaseSync(this.dbPath, { timeout: 5000 });
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+
+    // WAL normally gives the best concurrency, but some Docker bind mounts
+    // (notably SELinux-labelled/remote filesystems) cannot support SQLite's
+    // WAL/journal file semantics. Do not let that make the whole bot fail to
+    // start: prefer WAL and fall back to an in-memory rollback journal.
+    try {
+      const row = this.db.prepare("PRAGMA journal_mode=WAL").get();
+      console.log(`[storage] journal_mode=${row?.journal_mode ?? "wal"}`);
+    } catch (error) {
+      console.warn(
+        `[storage] WAL unavailable (${error?.message ?? error}); falling back to MEMORY journal`,
+      );
+      const row = this.db.prepare("PRAGMA journal_mode=MEMORY").get();
+      console.log(`[storage] journal_mode=${row?.journal_mode ?? "memory"}`);
+    }
+
     this.#migrate();
   }
 

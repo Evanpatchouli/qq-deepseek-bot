@@ -173,7 +173,7 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data:Z
 ```
 
 创建数据目录：
@@ -214,6 +214,15 @@ SQLite 数据默认位于：
 ```
 
 因此重新创建容器不会丢失账本、笔记和小确幸数据。
+
+在 CentOS / RHEL 等启用 SELinux 的宿主机上，建议保留挂载后的 `:Z`：
+
+```yaml
+volumes:
+  - ./data:/app/data:Z
+```
+
+Qgent 启动时优先使用 SQLite WAL；如果当前挂载环境不支持 WAL，会自动降级为 `MEMORY` journal，避免仅因 journal 模式不兼容导致整个机器人无法启动。
 
 ---
 
