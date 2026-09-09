@@ -1,1 +1,1 @@
-- [x] FIX_SQLITE_IO：补全 WAL/初始化阶段的 SQLite I/O 降级与诊断
+- [x] FIX_SQLITE_IO：补全 WAL/初始化阶段的 SQLite I/O 降级、诊断和 CentOS 7 镜像兼容

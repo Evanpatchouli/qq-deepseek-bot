@@ -18,6 +18,14 @@ errcode: 778
 
 `:Z` 只处理 SELinux 标签，不会修复其他几类问题。
 
+当前 `node:22-alpine` 会跟随 Alpine 最新版本。CentOS 7 的旧内核/旧 Docker seccomp 可能无法兼容较新的 Alpine/musl SQLite 写入路径，因此 Dockerfile 固定使用：
+
+```dockerfile
+FROM node:22-alpine3.23
+```
+
+如果 Docker Engine 仍然过旧，长期方案是升级 Docker/内核或迁移到仍受支持的 Linux 发行版；不建议把 `seccomp` 长期设置为 `unconfined`。
+
 ## 修改
 
 1. `docker-compose.yml` 的数据挂载改为：

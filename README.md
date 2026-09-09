@@ -240,7 +240,7 @@ docker compose down
 docker compose up -d --build
 ```
 
-仍然失败时，检查 SELinux 拒绝记录：
+仍然失败时，检查 SELinux 拒绝记录；如果宿主机是 CentOS 7，还需要确认 Docker Engine 和内核与当前 Node 镜像的系统调用兼容：
 
 ```bash
 sudo ausearch -m avc -ts recent | tail -n 50
@@ -521,7 +521,7 @@ chmod +x setup-menu.sh
 如果需要在容器内运行菜单配置脚本，Dockerfile 必须把 `scripts` 目录复制进去：
 
 ```dockerfile
-FROM node:22-alpine
+FROM node:22-alpine3.23
 
 WORKDIR /app
 
