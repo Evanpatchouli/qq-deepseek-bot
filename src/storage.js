@@ -2,6 +2,42 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+const DATABASE_TIMEOUT_MS = 5000;
+
+function openDatabase(dbPath, options) {
+  return new DatabaseSync(dbPath, options);
+}
+
+function isSqliteIoError(error) {
+  const code = String(error?.code ?? "").toUpperCase();
+  const message = String(error?.message ?? error).toLowerCase();
+
+  return (
+    code.startsWith("SQLITE_IOERR") ||
+    message.includes("disk i/o error") ||
+    message.includes("database or disk is full")
+  );
+}
+
+function journalModeFromRow(row) {
+  return String(row?.journal_mode ?? "").trim().toLowerCase();
+}
+
+function journalModeMismatch(requested, actual) {
+  const error = new Error(
+    `SQLite requested journal_mode=${requested.toLowerCase()}, got ${actual || "unknown"}`,
+  );
+  error.code = "SQLITE_IOERR_JOURNAL_MODE";
+  return error;
+}
+
+function storageInitializationError(dbPath, error) {
+  return new Error(
+    `SQLite initialization failed for ${dbPath}: ${error?.message ?? error}`,
+    { cause: error },
+  );
+}
+
 function localDateParts(timeZone, date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -62,30 +98,63 @@ function normalizeTags(tags) {
 }
 
 export class QgentStore {
-  constructor({ dbPath, timeZone = "Asia/Shanghai" }) {
+  constructor({ dbPath, timeZone = "Asia/Shanghai", databaseFactory = openDatabase }) {
     this.dbPath = path.resolve(dbPath);
     this.timeZone = timeZone;
+    this.databaseFactory = databaseFactory;
+    this.db = null;
+    this.journalMode = null;
 
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
-    this.db = new DatabaseSync(this.dbPath, { timeout: 5000 });
-    this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    this.#initialize();
+  }
 
-    // WAL normally gives the best concurrency, but some Docker bind mounts
-    // (notably SELinux-labelled/remote filesystems) cannot support SQLite's
-    // WAL/journal file semantics. Do not let that make the whole bot fail to
-    // start: prefer WAL and fall back to an in-memory rollback journal.
-    try {
-      const row = this.db.prepare("PRAGMA journal_mode=WAL").get();
-      console.log(`[storage] journal_mode=${row?.journal_mode ?? "wal"}`);
-    } catch (error) {
-      console.warn(
-        `[storage] WAL unavailable (${error?.message ?? error}); falling back to MEMORY journal`,
-      );
-      const row = this.db.prepare("PRAGMA journal_mode=MEMORY").get();
-      console.log(`[storage] journal_mode=${row?.journal_mode ?? "memory"}`);
+  #initialize() {
+    let lastError = null;
+
+    for (const requestedMode of ["WAL", "MEMORY"]) {
+      let databaseOpened = false;
+
+      try {
+        this.db = this.databaseFactory(this.dbPath, { timeout: DATABASE_TIMEOUT_MS });
+        databaseOpened = true;
+        this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+
+        const row = this.db.prepare(`PRAGMA journal_mode=${requestedMode}`).get();
+        const actualMode = journalModeFromRow(row);
+        if (actualMode !== requestedMode.toLowerCase()) {
+          throw journalModeMismatch(requestedMode, actualMode);
+        }
+
+        this.#migrate();
+        this.journalMode = actualMode;
+        console.log(`[storage] journal_mode=${actualMode}`);
+        return;
+      } catch (error) {
+        lastError = error;
+        this.#closeDatabase();
+
+        const canRetryWithMemory =
+          requestedMode === "WAL" && databaseOpened && isSqliteIoError(error);
+        if (!canRetryWithMemory) {
+          throw storageInitializationError(this.dbPath, error);
+        }
+
+        console.warn(
+          `[storage] WAL initialization failed (${error?.message ?? error}); retrying with MEMORY journal`,
+        );
+      }
     }
 
-    this.#migrate();
+    throw storageInitializationError(this.dbPath, lastError);
+  }
+
+  #closeDatabase() {
+    try {
+      if (this.db?.isOpen) this.db.close();
+    } finally {
+      this.db = null;
+    }
   }
 
   #migrate() {
@@ -366,6 +435,6 @@ export class QgentStore {
   }
 
   close() {
-    if (this.db?.isOpen) this.db.close();
+    this.#closeDatabase();
   }
 }

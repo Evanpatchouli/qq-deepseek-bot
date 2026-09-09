@@ -222,7 +222,29 @@ volumes:
   - ./data:/app/data:Z
 ```
 
-Qgent 启动时优先使用 SQLite WAL；如果当前挂载环境不支持 WAL，会自动降级为 `MEMORY` journal，避免仅因 journal 模式不兼容导致整个机器人无法启动。
+Qgent 启动时优先使用 SQLite WAL。如果 WAL 设置或首次建表阶段出现 SQLite I/O 错误，程序会关闭当前连接、重新打开数据库并降级为 `MEMORY` journal；两种模式都无法写入时才会启动失败，并保留底层错误用于定位宿主机目录、权限、磁盘空间或文件系统问题。
+
+CentOS 7 本身并不阻止 SQLite 工作，但其常见的 SELinux 和旧版 Docker 环境可能影响容器对 bind mount 的写入。遇到 `disk I/O error` 时可检查：
+
+```bash
+getenforce
+ls -Zd ./data
+docker inspect qq-deepseek-bot --format '{{json .Mounts}}'
+df -h ./data
+```
+
+如果 SELinux 为 `Enforcing`，修改 `:Z` 或目录标签后必须重新创建容器：
+
+```bash
+docker compose down
+docker compose up -d --build
+```
+
+仍然失败时，检查 SELinux 拒绝记录：
+
+```bash
+sudo ausearch -m avc -ts recent | tail -n 50
+```
 
 ---
 
