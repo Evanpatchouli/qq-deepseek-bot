@@ -266,7 +266,28 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 
 ---
 
-## 6. 联网搜索
+## 6. 天气接口与联网搜索
+
+天气优先通过本地工具 `qgent_get_weather` 调用 [UAPI 天气接口](https://uapis.cn/docs/api-reference/get-misc-weather)，不依赖 DeepSeek 是否触发 Web Search。
+
+在 `.env` 配置：
+
+```env
+UAPI_API_KEY=你的UAPI_API_Key
+UAPI_WEATHER_TIMEOUT_MS=10000
+UAPI_WEATHER_EXTENDED=false
+QGENT_DEFAULT_LOCATION=乌鲁木齐
+```
+
+Key 通过 `Authorization: Bearer` 请求头只发送给 UAPI，不进入模型上下文。未配置 Key 时机器人仍可启动，天气工具会明确返回配置缺失。超时默认 10 秒，覆盖请求与响应读取。
+
+默认查询当前天气、温度、湿度、风向风力和数据更新时间。账户支持高级参数时，可设 `UAPI_WEATHER_EXTENDED=true`，同时请求体感等扩展字段、未来预报及生活指数；权限不足或额度耗尽会明确报错，不自动切换访客请求。未返回的字段不会补造，实况不能替代全天预报。
+
+地点取自用户、当前对话或 `QGENT_DEFAULT_LOCATION`；无法确定时先询问，不使用服务器 IP 定位。回复应注明接口返回地点、更新时间和 UAPI 来源。
+
+更新代码和 `.env` 后执行 `docker compose up -d --build` 重新创建容器。无需新增依赖或数据库迁移。可在 QQ 中先 `/reset`，再问“今天乌鲁木齐天气怎么样？怎么穿？”，日志应出现 `name=qgent_get_weather success=true`。即使 `DEEPSEEK_WEB_SEARCH=false`，此天气工具也能工作。
+
+### 联网搜索
 
 Qgent 使用 DeepSeek Responses API，并可开启服务端 Web Search：
 
@@ -278,7 +299,7 @@ DEEPSEEK_WEB_SEARCH=true
 
 适合：
 
-- 实时天气
+- 天气补充资料（实况优先使用上述 UAPI 工具）
 - 新闻
 - 产品与价格调查
 - 店铺、地点、营业信息

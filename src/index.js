@@ -2,6 +2,7 @@ import { config } from "./config.js";
 import { ConversationMemory } from "./memory.js";
 import { DeepSeekClient } from "./deepseek.js";
 import { DeepSeekBalanceClient } from "./balance.js";
+import { WeatherClient } from "./weather.js";
 import { QgentStore } from "./storage.js";
 import { startHealthServer } from "./health.js";
 import { createQQBot } from "./qqbot.js";
@@ -17,7 +18,8 @@ const state = {
 
 const memory = new ConversationMemory(config.memory);
 const store = new QgentStore(config.storage);
-const ai = new DeepSeekClient({ ...config.deepseek, store });
+const weather = new WeatherClient(config.weather);
+const ai = new DeepSeekClient({ ...config.deepseek, store, weather });
 const balance = new DeepSeekBalanceClient({
   apiKey: config.deepseek.apiKey,
   baseURL: config.deepseek.balanceBaseURL,

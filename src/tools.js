@@ -1,6 +1,17 @@
 export const qgentTools = [
   {
     type: "function",
+    name: "qgent_get_weather",
+    description: "通过 UAPI 查询指定城市/地区的实时天气。询问天气、气温、下雨或基于天气的穿衣建议时优先调用。city 必须来自用户、对话或配置的默认地点，不可猜测。预报及体感等字段仅在服务配置支持时返回。",
+    parameters: {
+      type: "object",
+      properties: { city: { type: "string", minLength: 1, maxLength: 100, description: "明确的城市/地区名称，例如乌鲁木齐、北京市海淀区" } },
+      required: ["city"],
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
     name: "qgent_add_note",
     description:
       "把用户明确要求保存/记下的普通笔记持久化保存。只有用户确实要求记录时才调用；不要因为普通聊天内容看起来有用就擅自保存。",
@@ -144,9 +155,15 @@ function parseArgs(raw) {
   }
 }
 
-export async function executeQgentTool({ call, userId, store }) {
+/** Execute a validated tool in the current user's context. */
+export async function executeQgentTool({ call, userId, store, weather }) {
   if (!userId) throw new Error("缺少用户标识，不能读写私人数据");
   const args = parseArgs(call.arguments);
+  if (call.name === "qgent_get_weather") {
+    if (!weather) throw new Error("天气服务未配置");
+    return weather.getWeather(args);
+  }
+  if (!store) throw new Error("Qgent persistent store is not configured");
 
   switch (call.name) {
     case "qgent_add_note":

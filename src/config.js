@@ -52,6 +52,11 @@ export const config = {
       process.env.SYSTEM_PROMPT?.trim() ||
       "你叫 Qgent，是一个运行在 QQ 中的个人 AI 小助手。请使用简体中文，回答准确、自然、简洁。",
   },
+  weather: {
+    apiKey: process.env.UAPI_API_KEY?.trim() || "",
+    timeoutMs: int("UAPI_WEATHER_TIMEOUT_MS", 10_000),
+    extended: bool("UAPI_WEATHER_EXTENDED", false),
+  },
   storage: {
     dbPath: process.env.QGENT_DB_PATH?.trim() || "./data/qgent.db",
     timeZone: process.env.QGENT_TIMEZONE?.trim() || "Asia/Shanghai",
