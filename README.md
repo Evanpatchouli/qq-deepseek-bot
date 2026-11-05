@@ -438,6 +438,8 @@ QGENT_BALANCE_ALLOWED_OPENIDS=你的QQ_C2C_OpenID
 
 ## 10. Qgent System Prompt
 
+QQ 消息按纯文本展示。程序会在每次 DeepSeek 请求的统一指令中追加纯文本回复规则，即使自定义了 `SYSTEM_PROMPT` 也生效：不使用 Markdown 标题、加粗、斜体、引用、代码围栏、行内代码、表格或链接语法；用自然段、换行和中文序号组织内容，链接直接提供完整网址，代码按纯文本展示。更新后执行 `docker compose up -d --build` 生效，无需新增环境变量或数据库迁移。
+
 推荐给 Qgent 设置稳定的人格：
 
 - 生动活泼
