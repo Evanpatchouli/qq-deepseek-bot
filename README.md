@@ -401,7 +401,64 @@ QQ 中发送 `/status` 可直接查看当前用户最近 10 条成功保存的�
 
 新增 `tool_receipts` 和 `message_results` 表在启动时自动创建，兼容已有数据库，无需删除或手动迁移。缓存回答与工具执行凭据也是持久化用户数据，`/reset` 仅清空模型使用的临时对话上下文，不删除这些数据。
 
-验证：`npm test`；部署更新：`docker compose up -d --build`。本轮没有新增依赖或环境变量。SQLite 一致性备份与恢复仍是后续 P0 工作。
+验证：`npm test`；部署更新：`docker compose up -d --build`。本轮没有新增依赖或环境变量。SQLite 一致性备份与恢复操作见下节。
+
+### SQLite 一致性备份与恢复
+
+提供 `db:backup`、`db:verify`、`db:restore` 三个维护命令，使用 Node.js 自带的 SQLite，无需新增依赖、环境变量或数据库迁移。维护脚本不读取 `.env`，也不需要 QQ / DeepSeek 凭证；源路径必须显式指定，备份输出路径可自动生成，恢复输出路径必须显式指定。自定义了 `QGENT_DB_PATH` 时，请把下面的源路径改为实际数据库路径。
+
+备份使用 SQLite `VACUUM INTO` 生成一致性快照，包含快照时已提交但仍在 WAL 中的数据，不包含未提交事务。服务可保持运行；不要直接复制运行中的 `qgent.db` 单文件。生成过程中需要足够的临时磁盘空间，可能短暂影响数据库读写，锁冲突或 I/O 错误时命令失败，请排查后重试。
+
+输出先写入目标目录内的私有临时目录，通过完整性、外键和 Qgent 核心表校验，再发布为独立 `.db` 文件；不需要附带 `-wal` / `-shm` 文件。文件权限为 `0600`，目标文件系统需支持硬链接（常规 Linux 本地文件系统支持）。已有目标、符号链接或同名 SQLite 辅助文件一律拒绝覆盖。备份包含全部用户数据、执行凭据和回复缓存，请保存在私有目录，并定期复制到服务器以外的安全位置；同一磁盘上的副本不能防止磁盘故障。暂不自动安排备份或清理历史副本。
+
+推荐在宿主机直接运行一键脚本：
+
+```bash
+./backup-db.sh
+```
+
+脚本从项目目录启动临时 Docker Compose 容器，不要求机器人正在运行，也不会重启机器人。默认备份 `/app/data/qgent.db`，文件保存到宿主机 `./data/backups/qgent-20261105143532.db` 这样的路径。时间固定使用北京时间（Asia/Shanghai），格式为 `YYYYMMDDHHmmss`；同一秒重复备份时自动追加 `-1`、`-2`，已有文件仍受防覆盖保护。多个独立备份进程恰好争用同一文件名时，其中一个可能安全失败，重新运行即可。
+
+首次使用或更新脚本后先执行 `docker compose build qq-deepseek-bot`。自定义数据库路径时，例如配置为 `/app/data/custom.db`，运行 `./backup-db.sh /app/data/custom.db`；路径是容器内路径，需位于持久化挂载目录中。
+
+本地也可以自动生成文件名：
+
+```bash
+npm run db:backup -- --source ./data/qgent.db
+```
+
+默认保存到源数据库同目录下的 `backups/`，执行完成会输出实际文件路径；也可以通过 `--output` 手动指定新文件名，再校验：
+
+```bash
+npm run db:backup -- --source ./data/qgent.db --output ./data/backups/qgent-20261105143532.db
+npm run db:verify -- --source ./data/backups/qgent-20261105143532.db
+```
+
+Docker 中先更新镜像以获得脚本，再在线备份。容器 `/app/data/backups` 对应宿主机 `./data/backups`：
+
+```bash
+docker compose up -d --build
+docker compose exec -T qq-deepseek-bot npm run db:backup -- --source /app/data/qgent.db --output /app/data/backups/qgent-20261105143532.db
+docker compose exec -T qq-deepseek-bot npm run db:verify -- --source /app/data/backups/qgent-20261105143532.db
+```
+
+先在独立目录演练恢复，不修改正在运行的生产库：
+
+```bash
+docker compose run --rm --no-deps -T qq-deepseek-bot npm run db:restore -- --source /app/data/backups/qgent-20261105143532.db --output /app/data/restore-check-20261105/qgent.db
+docker compose run --rm --no-deps -T qq-deepseek-bot npm run db:verify -- --source /app/data/restore-check-20261105/qgent.db
+```
+
+需要真正恢复生产时，执行以下顺序；恢复后只包含备份时的数据，备份之后的记录和幂等凭据不会随之恢复：
+
+1. 执行 `docker compose stop qq-deepseek-bot`，确保其他使用相同数据库的进程也已停止。内存队列不会保留，尽量等待当前对话完成再停止。
+2. 用上述 `db:restore` 命令恢复到一个全新的目录，例如 `/app/data/recovery-20261105/qgent.db`，再执行 `db:verify`。不要覆盖当前数据库或混用旧 WAL / SHM；原库及其辅助文件保持原样以便回退。
+3. 将 `.env` 中 `QGENT_DB_PATH` 修改为该新路径，执行 `docker compose up -d` 重新创建容器；单独 `restart` 不会加载新的环境变量。
+4. 用 `docker compose ps`、`curl --fail http://127.0.0.1:3000/healthz` 检查启动，并在 QQ 查询已知的账目、笔记和小确幸。需要回退时先停服务，再把 `QGENT_DB_PATH` 改回原路径，重新执行 `docker compose up -d`。
+
+本地恢复同样先停止机器人，再执行 `npm run db:restore -- --source <备份路径> --output <全新数据库路径>`，修改 `.env` 中的 `QGENT_DB_PATH` 后重新启动。上述备份与恢复是管理员命令，不向模型暴露文件操作工具。
+
+自动化测试 `npm test` 覆盖运行中 WAL 备份、未提交事务排除、恢复后读写及用户隔离、执行凭据保留、旧库兼容、损坏 / 错误数据库拒绝、已有文件防覆盖及无凭证 CLI 使用。
 
 ## 9. DeepSeek 余额查询
 
@@ -589,7 +646,8 @@ qq-deepseek-bot/
 ├── data/
 │   └── qgent.db
 ├── scripts/
-│   └── setup-menu.js
+│   ├── setup-menu.js
+│   └── database.js
 ├── src/
 │   ├── balance.js
 │   ├── index.js
@@ -608,6 +666,7 @@ qq-deepseek-bot/
 ├── docker-compose.yml
 ├── package.json
 ├── setup-menu.sh
+├── backup-db.sh
 └── README.md
 ```
 
@@ -663,7 +722,7 @@ qq-deepseek-bot/
 
 迭代计划见 [ROADMAP.md](ROADMAP.md)，以下为规划，尚未完成：
 
-1. P0：消息排队、原消息写入幂等、整段 AI 超时与失败保存状态反馈已实现；待完成 SQLite 一致性备份与恢复，及 QQ 真实环境验收。
+1. P0：消息排队、原消息写入幂等、整段 AI 超时与失败保存状态反馈已实现；SQLite 一致性备份、校验与恢复脚本已实现；QQ 消息顺序和故障恢复仍待完整实机验收。
 2. P1：验证 QQ 主动消息能力后，实现一次性提醒的创建、查询、取消和重启恢复。
 3. P1：账目、笔记和小确幸的修改、删除 / 撤销。
 4. P2：用户主动授权的偏好记忆、按需生活回顾；提醒链路稳定后再考虑订阅式天气提醒。

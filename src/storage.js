@@ -467,3 +467,80 @@ export class QgentStore {
     this.#closeDatabase();
   }
 }
+
+// Maintenance uses independent connections, never QgentStore initialization/migrations.
+// VACUUM INTO creates a consistent SQLite snapshot, including committed WAL pages.
+function openSnapshotSource(sourcePath) {
+  const filename = path.resolve(sourcePath);
+  if (!fs.statSync(filename).isFile()) throw new Error("数据库源路径必须是已有文件");
+  const database = new DatabaseSync(filename, { readOnly: true, timeout: DATABASE_TIMEOUT_MS });
+  try {
+    database.exec("PRAGMA busy_timeout=5000");
+    return database;
+  } catch (error) { database.close(); throw error; }
+}
+
+function checkSnapshot(database) {
+  const checks = database.prepare("PRAGMA integrity_check").all();
+  if (!checks.length || checks.some((row) => row.integrity_check !== "ok")) {
+    throw new Error("SQLite 完整性校验失败");
+  }
+  const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+  for (const name of ["notes", "ledger", "moments"]) {
+    if (!tables.has(name)) throw new Error(`不是可识别的 Qgent 数据库，缺少表 ${name}`);
+  }
+  if (database.prepare("PRAGMA foreign_key_check").all().length) throw new Error("SQLite 外键校验失败");
+}
+
+export function verifyDatabaseSnapshot(sourcePath) {
+  const database = openSnapshotSource(sourcePath);
+  try {
+    checkSnapshot(database);
+    return { path: path.resolve(sourcePath), integrity: "ok" };
+  } finally { database.close(); }
+}
+
+function assertUnusedDestination(filename) {
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    // lstat also refuses dangling symlinks instead of following/replacing them.
+    try { fs.lstatSync(filename + suffix); } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    throw new Error(`目标或 SQLite 辅助文件已存在，拒绝覆盖: ${filename + suffix}`);
+  }
+}
+
+export function createDatabaseSnapshot({ sourcePath, destinationPath }) {
+  const destination = path.resolve(destinationPath);
+  assertUnusedDestination(destination);
+  const source = openSnapshotSource(sourcePath);
+  let stagingDirectory;
+  try {
+    checkSnapshot(source);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    stagingDirectory = fs.mkdtempSync(path.join(path.dirname(destination), ".qgent-snapshot-"));
+    fs.chmodSync(stagingDirectory, 0o700);
+    const stagingFile = path.join(stagingDirectory, "snapshot.db");
+    source.prepare("VACUUM INTO ?").run(stagingFile);
+    fs.chmodSync(stagingFile, 0o600);
+    const snapshot = new DatabaseSync(stagingFile);
+    try {
+      // Publish one self-contained file, independent of WAL/SHM sidecars.
+      const mode = snapshot.prepare("PRAGMA journal_mode=DELETE").get();
+      if (mode.journal_mode !== "delete") throw new Error("无法生成独立的 SQLite 快照文件");
+      checkSnapshot(snapshot);
+    } finally { snapshot.close(); }
+    const descriptor = fs.openSync(stagingFile, "r");
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+    assertUnusedDestination(destination);
+    // Same-filesystem hard link publishes atomically and never replaces an existing file.
+    fs.linkSync(stagingFile, destination);
+    const directoryDescriptor = fs.openSync(path.dirname(destination), "r");
+    try { fs.fsyncSync(directoryDescriptor); } finally { fs.closeSync(directoryDescriptor); }
+    return { path: destination, integrity: "ok", bytes: fs.statSync(destination).size };
+  } finally {
+    source.close();
+    if (stagingDirectory) fs.rmSync(stagingDirectory, { recursive: true, force: true });
+  }
+}

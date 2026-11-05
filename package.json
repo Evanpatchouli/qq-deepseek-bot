@@ -11,7 +11,10 @@
     "dev": "node --watch --env-file=.env src/index.js",
     "start": "node --env-file=.env src/index.js",
     "menu:setup": "node scripts/setup-menu.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "db:backup": "node scripts/database.js backup",
+    "db:restore": "node scripts/database.js restore",
+    "db:verify": "node scripts/database.js verify"
   },
   "dependencies": {
     "@tencent-connect/qqbot-nodejs": "1.0.4",
