@@ -5,7 +5,7 @@
   "type": "module",
   "description": "QQ Open Platform AI bot backend powered by DeepSeek",
   "engines": {
-    "node": ">=20.6"
+    "node": ">=22.13"
   },
   "scripts": {
     "dev": "node --watch --env-file=.env src/index.js",

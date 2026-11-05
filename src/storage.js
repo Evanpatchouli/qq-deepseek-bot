@@ -8,17 +8,6 @@ function openDatabase(dbPath, options) {
   return new DatabaseSync(dbPath, options);
 }
 
-function isSqliteIoError(error) {
-  const code = String(error?.code ?? "").toUpperCase();
-  const message = String(error?.message ?? error).toLowerCase();
-
-  return (
-    code.startsWith("SQLITE_IOERR") ||
-    message.includes("disk i/o error") ||
-    message.includes("database or disk is full")
-  );
-}
-
 function journalModeFromRow(row) {
   return String(row?.journal_mode ?? "").trim().toLowerCase();
 }
@@ -110,43 +99,23 @@ export class QgentStore {
   }
 
   #initialize() {
-    let lastError = null;
+    try {
+      this.db = this.databaseFactory(this.dbPath, { timeout: DATABASE_TIMEOUT_MS });
+      this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
 
-    for (const requestedMode of ["WAL", "MEMORY"]) {
-      let databaseOpened = false;
-
-      try {
-        this.db = this.databaseFactory(this.dbPath, { timeout: DATABASE_TIMEOUT_MS });
-        databaseOpened = true;
-        this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-
-        const row = this.db.prepare(`PRAGMA journal_mode=${requestedMode}`).get();
-        const actualMode = journalModeFromRow(row);
-        if (actualMode !== requestedMode.toLowerCase()) {
-          throw journalModeMismatch(requestedMode, actualMode);
-        }
-
-        this.#migrate();
-        this.journalMode = actualMode;
-        console.log(`[storage] journal_mode=${actualMode}`);
-        return;
-      } catch (error) {
-        lastError = error;
-        this.#closeDatabase();
-
-        const canRetryWithMemory =
-          requestedMode === "WAL" && databaseOpened && isSqliteIoError(error);
-        if (!canRetryWithMemory) {
-          throw storageInitializationError(this.dbPath, error);
-        }
-
-        console.warn(
-          `[storage] WAL initialization failed (${error?.message ?? error}); retrying with MEMORY journal`,
-        );
+      const row = this.db.prepare("PRAGMA journal_mode=WAL").get();
+      const actualMode = journalModeFromRow(row);
+      if (actualMode !== "wal") {
+        throw journalModeMismatch("WAL", actualMode);
       }
-    }
 
-    throw storageInitializationError(this.dbPath, lastError);
+      this.#migrate();
+      this.journalMode = actualMode;
+      console.log(`[storage] journal_mode=${actualMode}`);
+    } catch (error) {
+      this.#closeDatabase();
+      throw storageInitializationError(this.dbPath, error);
+    }
   }
 
   #closeDatabase() {

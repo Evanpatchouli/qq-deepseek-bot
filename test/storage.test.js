@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ConversationMemory } from "../src/memory.js";
 import { QgentStore } from "../src/storage.js";
 
 function createTempDbPath() {
@@ -68,47 +69,23 @@ function createIoFailureFactory(failureStage) {
   };
 }
 
-test("reopens with MEMORY journal after WAL initialization I/O failure", (t) => {
-  const temporary = createTempDbPath();
-
-  const factory = createIoFailureFactory("wal");
-  const store = new QgentStore({
-    dbPath: temporary.dbPath,
-    databaseFactory: factory.open,
-  });
-  t.after(() => {
+for (const stage of ["wal", "migration"]) {
+  test(`fails without journal fallback after ${stage} I/O failure`, (t) => {
+    const temporary = createTempDbPath();
+    t.after(temporary.cleanup);
+    const factory = createIoFailureFactory(stage);
+    assert.throws(
+      () => new QgentStore({ dbPath: temporary.dbPath, databaseFactory: factory.open }),
+      (error) => error.message.includes("SQLite initialization failed") &&
+        error.cause?.code === "SQLITE_IOERR_WRITE",
+    );
+    assert.equal(factory.openCount, 1);
+    // A failed initialization releases its connection; a normal startup can recover.
+    const store = new QgentStore({ dbPath: temporary.dbPath });
+    assert.equal(store.journalMode, "wal");
     store.close();
-    temporary.cleanup();
   });
-
-  assert.equal(factory.openCount, 2);
-  assert.equal(store.journalMode, "memory");
-  assert.equal(
-    store.addNote("user-1", { content: "fallback works" }).success,
-    true,
-  );
-});
-
-test("reopens with MEMORY journal after migration I/O failure", (t) => {
-  const temporary = createTempDbPath();
-
-  const factory = createIoFailureFactory("migration");
-  const store = new QgentStore({
-    dbPath: temporary.dbPath,
-    databaseFactory: factory.open,
-  });
-  t.after(() => {
-    store.close();
-    temporary.cleanup();
-  });
-
-  assert.equal(factory.openCount, 2);
-  assert.equal(store.journalMode, "memory");
-  assert.equal(
-    store.addNote("user-1", { content: "migration fallback works" }).success,
-    true,
-  );
-});
+}
 
 test("persists records and keeps users isolated", (t) => {
   const temporary = createTempDbPath();
@@ -116,6 +93,16 @@ test("persists records and keeps users isolated", (t) => {
   const firstStore = new QgentStore({ dbPath: temporary.dbPath });
   firstStore.addNote("user-1", { content: "private note" });
   assert.equal(firstStore.searchNotes("user-2").count, 0);
+  firstStore.addLedgerEntry("user-1", { type: "expense", amount: 12.34 });
+  firstStore.addMoment("user-1", { content: "a good day" });
+  assert.equal(firstStore.listLedger("user-2").count, 0);
+  assert.equal(firstStore.ledgerSummary("user-2").count, 0);
+  assert.equal(firstStore.listMoments("user-2").count, 0);
+  assert.equal(firstStore.searchNotes("user-2", { query: "' OR 1=1 --" }).count, 0);
+  const memory = new ConversationMemory({ maxTurns: 8, ttlMs: 60_000 });
+  memory.appendTurn("user-1", "hello", "hi");
+  memory.clear("user-1");
+  assert.equal(firstStore.searchNotes("user-1").count, 1);
   firstStore.close();
 
   const secondStore = new QgentStore({ dbPath: temporary.dbPath });
@@ -125,6 +112,10 @@ test("persists records and keeps users isolated", (t) => {
   });
 
   const result = secondStore.searchNotes("user-1");
+  assert.equal(secondStore.journalMode, "wal");
+  assert.equal(secondStore.ledgerSummary("user-1").expense, 12.34);
+  assert.equal(secondStore.listLedger("user-1").count, 1);
+  assert.equal(secondStore.listMoments("user-1").count, 1);
   assert.equal(result.count, 1);
   assert.equal(result.notes[0].content, "private note");
 });

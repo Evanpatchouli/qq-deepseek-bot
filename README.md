@@ -36,8 +36,8 @@
 
 ## 1. 前置要求
 
-- Node.js >= 20.6
-- 推荐 Node.js 22 LTS
+- Node.js >= 22.13（支持无需额外启动参数的 `node:sqlite`）
+- Docker 宿主机：Debian 13，使用 Docker Compose 插件
 - 已在 QQ 开放平台创建机器人并取得 AppID / AppSecret
 - 已创建 DeepSeek API Key
 - Docker 部署时推荐使用 Docker Compose
@@ -173,7 +173,7 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
-      - ./data:/app/data:Z
+      - ./data:/app/data
 ```
 
 创建数据目录：
@@ -215,36 +215,11 @@ SQLite 数据默认位于：
 
 因此重新创建容器不会丢失账本、笔记和小确幸数据。
 
-在 CentOS / RHEL 等启用 SELinux 的宿主机上，建议保留挂载后的 `:Z`：
+容器使用 Debian Bookworm slim 系列的 Node.js 22 镜像，通过 `npm ci --omit=dev` 按锁文件安装依赖。
 
-```yaml
-volumes:
-  - ./data:/app/data:Z
-```
+SQLite 固定使用 WAL journal，不再在 I/O 错误时降级为 MEMORY journal。初始化失败会停止启动并保留底层错误；请检查数据目录权限、磁盘空间和文件系统状态。已有数据库会在打开时切换到 WAL，无需删除数据库或手动迁移。
 
-Qgent 启动时优先使用 SQLite WAL。如果 WAL 设置或首次建表阶段出现 SQLite I/O 错误，程序会关闭当前连接、重新打开数据库并降级为 `MEMORY` journal；两种模式都无法写入时才会启动失败，并保留底层错误用于定位宿主机目录、权限、磁盘空间或文件系统问题。
-
-CentOS 7 本身并不阻止 SQLite 工作，但其常见的 SELinux 和旧版 Docker 环境可能影响容器对 bind mount 的写入。遇到 `disk I/O error` 时可检查：
-
-```bash
-getenforce
-ls -Zd ./data
-docker inspect qq-deepseek-bot --format '{{json .Mounts}}'
-df -h ./data
-```
-
-如果 SELinux 为 `Enforcing`，修改 `:Z` 或目录标签后必须重新创建容器：
-
-```bash
-docker compose down
-docker compose up -d --build
-```
-
-仍然失败时，检查 SELinux 拒绝记录；如果宿主机是 CentOS 7，还需要确认 Docker Engine 和内核与当前 Node 镜像的系统调用兼容：
-
-```bash
-sudo ausearch -m avc -ts recent | tail -n 50
-```
+部署更新时执行 `docker compose up -d --build`，再通过 `docker compose ps`、容器日志和上述健康检查确认运行状态。
 
 ---
 
@@ -542,12 +517,12 @@ chmod +x setup-menu.sh
 如果需要在容器内运行菜单配置脚本，Dockerfile 必须把 `scripts` 目录复制进去：
 
 ```dockerfile
-FROM node:22-alpine3.23
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 COPY src ./src
 COPY scripts ./scripts

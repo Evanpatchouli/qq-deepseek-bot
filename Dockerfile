@@ -1,9 +1,9 @@
-FROM node:22-alpine3.23
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 COPY src ./src
 COPY scripts ./scripts
