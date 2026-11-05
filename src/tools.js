@@ -144,43 +144,86 @@ export const qgentTools = [
   },
 ];
 
-function parseArgs(raw) {
-  if (!raw) return {};
-  try {
-    const value = JSON.parse(raw);
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    return value;
-  } catch {
-    throw new Error("工具参数不是合法 JSON");
+export const writeToolNames = new Set(["qgent_add_note", "qgent_add_ledger", "qgent_add_moment"]);
+
+// A separate key permits two intentionally identical records in one message.
+for (const tool of qgentTools) {
+  const limits = { title: 120, query: 500, category: 80, note: 500,
+    content: tool.name === "qgent_add_moment" ? 3000 : 5000 };
+  for (const [field, maximum] of Object.entries(limits)) {
+    if (tool.parameters.properties[field]) tool.parameters.properties[field].maxLength = maximum;
+  }
+  if (writeToolNames.has(tool.name)) {
+    tool.parameters.properties.record_key = {
+      type: "string", maxLength: 80,
+      description: "同一消息确实包含多条完全相同的记录时，分别使用不同编号；重试同一条必须保持编号不变。通常省略。",
+    };
   }
 }
 
-/** Execute a validated tool in the current user's context. */
-export async function executeQgentTool({ call, userId, store, weather }) {
-  if (!userId) throw new Error("缺少用户标识，不能读写私人数据");
-  const args = parseArgs(call.arguments);
+function validateValue(value, schema, field) {
+  if (schema.type === "string" && (typeof value !== "string" ||
+      value.length > (schema.maxLength ?? 5000))) throw new Error(`${field} 必须是长度合适的文本`);
+  if (schema.type === "number" && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${field} 必须是大于 0 的数字`);
+  }
+  if (schema.type === "integer" && (!Number.isInteger(value) || value < schema.minimum || value > schema.maximum)) {
+    throw new Error(`${field} 超出允许范围`);
+  }
+  if (schema.type === "array") {
+    if (!Array.isArray(value) || value.length > 10) throw new Error(`${field} 必须是最多 10 项的列表`);
+    for (const item of value) validateValue(item, schema.items, field);
+  }
+  if (schema.enum && !schema.enum.includes(value)) throw new Error(`${field} 不是允许的值`);
+  if (["content", "city"].includes(field) && !value.trim()) throw new Error(`${field} 不能为空`);
+  if (["occurred_on", "start_date", "end_date"].includes(field)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) ||
+        !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value) {
+      throw new Error(`${field} 必须是真实的 YYYY-MM-DD 日期`);
+    }
+  }
+}
+
+function parseArgs(raw, tool) {
+  let value;
+  try { value = JSON.parse(raw); } catch { throw new Error("工具参数不是合法 JSON"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("工具参数必须是 JSON 对象");
+  const schema = tool.parameters;
+  for (const key of schema.required ?? []) {
+    if (!(key in value)) throw new Error(`缺少工具参数 ${key}`);
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (!Object.hasOwn(schema.properties, key)) throw new Error(`不支持的工具参数 ${key}`);
+    validateValue(item, schema.properties[key], key);
+    if (key === "amount" && (!Number.isSafeInteger(Math.round(item * 100)) || Math.round(item * 100) <= 0)) {
+      throw new Error("金额超出允许范围或不足一分");
+    }
+  }
+  if (value.start_date && value.end_date && value.start_date > value.end_date) throw new Error("开始日期不能晚于结束日期");
+  return value;
+}
+
+/** Execute a validated tool in the authenticated QQ user's context. */
+export async function executeQgentTool({ call, userId, store, weather, requestId, signal }) {
+  signal?.throwIfAborted();
+  if (typeof userId !== "string" || !userId.trim()) throw new Error("缺少用户标识，不能读写私人数据");
+  const tool = qgentTools.find((item) => item.name === call.name);
+  if (!tool) throw new Error("未知工具");
+  const args = parseArgs(call.arguments, tool);
   if (call.name === "qgent_get_weather") {
     if (!weather) throw new Error("天气服务未配置");
-    return weather.getWeather(args);
+    return weather.getWeather(args, { signal });
   }
   if (!store) throw new Error("Qgent persistent store is not configured");
-
-  switch (call.name) {
-    case "qgent_add_note":
-      return store.addNote(userId, args);
-    case "qgent_search_notes":
-      return store.searchNotes(userId, args);
-    case "qgent_add_ledger":
-      return store.addLedgerEntry(userId, args);
-    case "qgent_ledger_summary":
-      return store.ledgerSummary(userId, args);
-    case "qgent_list_ledger":
-      return store.listLedger(userId, args);
-    case "qgent_add_moment":
-      return store.addMoment(userId, args);
-    case "qgent_list_moments":
-      return store.listMoments(userId, args);
-    default:
-      throw new Error(`未知工具: ${call.name}`);
+  const methods = {
+    qgent_add_note: "addNote", qgent_search_notes: "searchNotes",
+    qgent_add_ledger: "addLedgerEntry", qgent_ledger_summary: "ledgerSummary",
+    qgent_list_ledger: "listLedger", qgent_add_moment: "addMoment",
+    qgent_list_moments: "listMoments",
+  };
+  const execute = () => store[methods[call.name]](userId, args);
+  if (requestId && writeToolNames.has(call.name)) {
+    return store.executeWriteOnce(userId, requestId, call.name, args, execute);
   }
+  return execute();
 }

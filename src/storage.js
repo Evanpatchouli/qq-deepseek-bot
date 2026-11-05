@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -128,6 +129,23 @@ export class QgentStore {
 
   #migrate() {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tool_receipts (
+        user_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        operation_key TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        result TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, request_id, operation_key)
+      );
+      CREATE TABLE IF NOT EXISTS message_results (
+        user_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, request_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_message_results_created ON message_results(created_at);
       CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
@@ -166,6 +184,48 @@ export class QgentStore {
       CREATE INDEX IF NOT EXISTS idx_moments_user_date
         ON moments(user_id, occurred_on DESC, id DESC);
     `);
+  }
+
+  executeWriteOnce(userId, requestId, toolName, args, execute) {
+    const canonical = JSON.stringify(Object.fromEntries(Object.keys(args).sort().map((key) => [key, args[key]])));
+    const operationKey = createHash("sha256").update(`${toolName}:${canonical}`).digest("hex");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.db.prepare(`SELECT result FROM tool_receipts
+        WHERE user_id = ? AND request_id = ? AND operation_key = ?`).get(userId, requestId, operationKey);
+      if (previous) {
+        this.db.exec("COMMIT");
+        return { ...JSON.parse(previous.result), duplicate: true };
+      }
+      const result = execute();
+      if (result?.success !== true) throw new Error("写入未成功");
+      this.db.prepare(`INSERT INTO tool_receipts
+        (user_id, request_id, operation_key, tool_name, result, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(userId, requestId, operationKey, toolName, JSON.stringify(result), this.nowIso());
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getWriteReceipts(userId, requestId) {
+    const rows = requestId
+      ? this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ? AND request_id = ? ORDER BY rowid`).all(userId, requestId)
+      : this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ? ORDER BY rowid DESC LIMIT 10`).all(userId);
+    return rows.map((row) => ({ name: row.tool_name, ...JSON.parse(row.result) }));
+  }
+
+  getMessageResult(userId, requestId) {
+    return this.db.prepare("SELECT answer FROM message_results WHERE user_id = ? AND request_id = ?").get(userId, requestId)?.answer;
+  }
+
+  saveMessageResult(userId, requestId, answer) {
+    const expiresBefore = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    this.db.prepare("DELETE FROM message_results WHERE created_at < ?").run(expiresBefore);
+    this.db.prepare(`INSERT OR IGNORE INTO message_results (user_id, request_id, answer, created_at)
+      VALUES (?, ?, ?, ?)`).run(userId, requestId, answer, this.nowIso());
   }
 
   nowIso() {

@@ -8,7 +8,8 @@ export class WeatherClient {
   }
 
   /** Fetch current weather for an explicit city; never use server IP location. */
-  async getWeather(args) {
+  async getWeather(args, { signal } = {}) {
+    signal?.throwIfAborted();
     if (!args || typeof args !== "object" || Array.isArray(args) ||
         Object.keys(args).some((key) => key !== "city") ||
         typeof args.city !== "string" || !args.city.trim() ||
@@ -28,7 +29,7 @@ export class WeatherClient {
       const response = await this.fetchImpl(url, {
         headers: { Accept: "application/json", Authorization: `Bearer ${this.apiKey}` },
         redirect: "error",
-        signal: controller.signal,
+        signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       });
       if (!response.ok) {
         const messages = {

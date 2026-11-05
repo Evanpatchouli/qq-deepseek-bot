@@ -58,6 +58,7 @@ export class DeepSeekClient {
     store,
     weather,
   }) {
+    this.timeoutMs = timeoutMs ?? 45_000;
     this.model = model;
     this.webSearchEnabled = webSearchEnabled;
     this.defaultLocation = defaultLocation;
@@ -93,7 +94,40 @@ export class DeepSeekClient {
     return tools;
   }
 
-  async chat({ history, prompt, userId }) {
+  async chat({ history, prompt, userId, requestId }) {
+    const controller = new AbortController();
+    const deadline = Date.now() + this.timeoutMs;
+    const timer = setTimeout(() => controller.abort(new Error("AI 总处理超时")), this.timeoutMs);
+    const signal = controller.signal;
+    // Also check wall time: synchronous SQLite lock waits can delay timer callbacks.
+    const check = () => {
+      if (Date.now() >= deadline && !signal.aborted) controller.abort(new Error("AI 总处理超时"));
+      signal.throwIfAborted();
+    };
+    const wait = async (operation) => {
+      check();
+      let abort;
+      const cancelled = new Promise((_, reject) => {
+        abort = () => reject(signal.reason);
+        signal.addEventListener("abort", abort, { once: true });
+      });
+      try {
+        const result = await Promise.race([operation(), cancelled]);
+        check();
+        return result;
+      } finally { signal.removeEventListener("abort", abort); }
+    };
+    try {
+      return await this.runChat({ history, prompt, userId, requestId, signal, wait, check });
+    } catch (error) {
+      // Receipts survive both total timeout and a failed final API response.
+      const failure = new Error(`AI 处理未完成: ${error.message}`, { cause: error });
+      failure.savedResults = requestId ? this.store?.getWriteReceipts(userId, requestId) ?? [] : [];
+      throw failure;
+    } finally { clearTimeout(timer); }
+  }
+
+  async runChat({ history, prompt, userId, requestId, signal, wait, check }) {
     let input = [
       ...history,
       { role: "user", content: prompt },
@@ -104,32 +138,47 @@ export class DeepSeekClient {
     let finalResponse = null;
 
     for (let round = 0; round < this.maxToolRounds; round += 1) {
-      const response = await this.client.responses.create({
+      const response = await wait(() => this.client.responses.create({
         model: this.model,
         instructions: this.#instructions(),
         input,
         tools: this.#tools(),
         tool_choice: "auto",
         stream: false,
-      });
+      }, { signal, timeout: Math.max(1, this.timeoutMs) }));
+      if (!response || (response.status && response.status !== "completed") || response.error ||
+          (response.output !== undefined && !Array.isArray(response.output))) {
+        throw new Error("DeepSeek returned an incomplete or invalid response");
+      }
 
       finalResponse = response;
       totalWebSearchCalls += countWebSearchCalls(response);
       const calls = functionCalls(response);
 
+      {
+        const failedSearch = (response.output ?? []).some((item) => item?.type === "web_search_call" &&
+          item.status && item.status !== "completed");
+        if (failedSearch) throw new Error("Web Search failed");
+      }
       if (calls.length === 0) break;
+      if (calls.length > 16 || calls.some((call) => typeof call.call_id !== "string" || !call.call_id.trim())) {
+        throw new Error("Invalid or excessive tool calls");
+      }
+      if (round === this.maxToolRounds - 1) throw new Error("DeepSeek exceeded the local tool round limit");
 
       input = [...input, ...(response.output ?? [])];
 
       for (const call of calls) {
+        check();
         localToolCalls += 1;
         let result;
         try {
-          result = await executeQgentTool({ call, userId, store: this.store, weather: this.weather });
-          console.log(`[tool] user=${userId} name=${call.name} success=true`);
+          result = await wait(() => executeQgentTool({ call, userId, requestId, signal, store: this.store, weather: this.weather }));
+          console.log(`[tool] user=${userId} name=${call.name} success=${result?.success === true}`);
         } catch (error) {
-          result = { success: false, error: String(error?.message || error) };
-          console.error(`[tool] user=${userId} name=${call.name} success=false`, error);
+          check();
+          result = { success: false, error: "工具执行失败，请检查参数或稍后查询确认。" };
+          console.error(`[tool] user=${userId} name=${qgentTools.some((tool) => tool.name === call.name) ? call.name : "unknown"} success=false`, { name: error?.name });
         }
 
         input.push({
