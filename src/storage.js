@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { ReminderInputError, reminderLocalTime, reminderTimestamp } from "./reminders.js";
 
 const DATABASE_TIMEOUT_MS = 5000;
 
@@ -183,6 +184,28 @@ export class QgentStore {
 
       CREATE INDEX IF NOT EXISTS idx_moments_user_date
         ON moments(user_id, occurred_on DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('c2c', 'group')),
+        target_id TEXT NOT NULL CHECK (length(target_id) > 0),
+        content TEXT NOT NULL,
+        trigger_at INTEGER NOT NULL,
+        timezone TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','sending','sent','cancelled','expired','failed','unknown')),
+        created_at TEXT NOT NULL,
+        next_attempt_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER,
+        qq_message_id TEXT,
+        detail TEXT,
+        CHECK (scope <> 'c2c' OR target_id = user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_reminders_owner ON reminders(user_id, scope, target_id);
+      CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, next_attempt_at);
+      CREATE INDEX IF NOT EXISTS idx_reminders_attempts ON reminders(scope, target_id, last_attempt_at);
     `);
   }
 
@@ -210,10 +233,13 @@ export class QgentStore {
     }
   }
 
-  getWriteReceipts(userId, requestId) {
+  getWriteReceipts(userId, requestId, conversationKey) {
+    const prefix = conversationKey ? `${conversationKey}:message:` : null;
     const rows = requestId
       ? this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ? AND request_id = ? ORDER BY rowid`).all(userId, requestId)
-      : this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ? ORDER BY rowid DESC LIMIT 10`).all(userId);
+      : this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ?
+          AND (? IS NULL OR tool_name NOT IN ('qgent_create_reminder', 'qgent_cancel_reminder') OR instr(request_id, ?) = 1)
+          ORDER BY rowid DESC LIMIT 10`).all(userId, prefix, prefix);
     return rows.map((row) => ({ name: row.tool_name, ...JSON.parse(row.result) }));
   }
 
@@ -461,6 +487,69 @@ export class QgentStore {
     `).all(userId, safeLimit);
 
     return { success: true, count: rows.length, moments: rows };
+  }
+
+  addReminder(userId, { content, trigger_at, timezone = this.timeZone }, target) {
+    const text = content.trim();
+    if (!text || text.length > 500) throw new ReminderInputError("提醒内容应为 1 至 500 个字符。");
+    const triggerAt = reminderTimestamp(trigger_at, timezone, Date.now());
+    const result = this.db.prepare(`
+      INSERT INTO reminders (user_id, scope, target_id, content, trigger_at, timezone, created_at, next_attempt_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(userId, target.scope, target.targetId, text, triggerAt, timezone, this.nowIso(), triggerAt);
+    return {
+      success: true, id: Number(result.lastInsertRowid), status: "pending", scope: target.scope,
+      content: text, trigger_at: new Date(triggerAt).toISOString(), local_time: reminderLocalTime(triggerAt, timezone), timezone,
+    };
+  }
+
+  listReminders(userId, { id = null, status = null, limit = 10 }, target) {
+    const reminders = this.db.prepare(`
+      SELECT id, content, trigger_at, timezone, status, detail FROM reminders
+      WHERE user_id = ? AND scope = ? AND target_id = ?
+        AND (? IS NULL OR id = ?) AND (? IS NULL OR status = ?)
+      ORDER BY CASE WHEN status = 'pending' THEN trigger_at END ASC NULLS LAST, trigger_at DESC, id DESC
+      LIMIT ?
+    `).all(userId, target.scope, target.targetId, id, id, status, status, clampLimit(limit)).map((row) => ({
+      ...row, trigger_at: new Date(row.trigger_at).toISOString(), local_time: reminderLocalTime(row.trigger_at, row.timezone),
+    }));
+    return { success: true, count: reminders.length, reminders };
+  }
+
+  cancelReminder(userId, { id }, target) {
+    const result = this.db.prepare(`UPDATE reminders SET status = 'cancelled', detail = NULL
+      WHERE user_id = ? AND scope = ? AND target_id = ? AND id = ? AND status = 'pending'`)
+      .run(userId, target.scope, target.targetId, id);
+    if (!result.changes) throw new ReminderInputError("当前会话没有这条可取消的待发送提醒，请先查询状态。");
+    return { success: true, id, status: "cancelled" };
+  }
+
+  // Only the scheduler can claim across owners. A single UPDATE arbitrates
+  // between a due send, a concurrent scan and an owner's cancellation.
+  claimDueReminder(now, oldestDue, staleSend) {
+    this.db.prepare(`UPDATE reminders SET status = 'expired', detail = '已超过补发期限'
+      WHERE status = 'pending' AND next_attempt_at <= ? AND trigger_at < ?`).run(now, oldestDue);
+    this.db.prepare(`UPDATE reminders SET status = 'unknown', detail = '发送中断，未能确认 QQ 回执'
+      WHERE status = 'sending' AND last_attempt_at <= ?`).run(staleSend);
+    // Count attempts conservatively over a rolling 24 hours, shared by all
+    // owners in a group. A saturated target must not block other recipients.
+    return this.db.prepare(`
+      UPDATE reminders SET status = 'sending', last_attempt_at = ?, attempts = attempts + 1, detail = NULL
+      WHERE id = (
+        SELECT r.id FROM reminders r WHERE r.status = 'pending' AND r.next_attempt_at <= ?
+        AND (SELECT COALESCE(SUM(h.attempts), 0) FROM reminders h
+             WHERE h.scope = r.scope AND h.target_id = r.target_id AND h.last_attempt_at > ?) < 1000
+        ORDER BY r.next_attempt_at, r.id LIMIT 1
+      ) AND status = 'pending'
+      RETURNING id, scope, target_id, content, attempts
+    `).get(now, now, now - 24 * 60 * 60_000);
+  }
+
+  finishReminder(id, { status, detail = null, messageId = null, retryAt = null }) {
+    const result = this.db.prepare(`UPDATE reminders SET status = ?, detail = ?, qq_message_id = ?,
+      next_attempt_at = COALESCE(?, next_attempt_at)
+      WHERE id = ? AND status = 'sending'`).run(status, detail, messageId, retryAt, id);
+    if (!result.changes) throw new Error("提醒的发送状态已变更，未写入本次结果");
   }
 
   close() {

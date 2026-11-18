@@ -20,7 +20,7 @@ Qgent 主要服务个人日常生活场景，包括但不限于：
 - 记账与账目汇总
 - 笔记
 - 生活小确幸记录
-- 待办与提醒（规划中）
+- 一次性提醒，待办仍在规划中
 - 后续可扩展图片理解、语音、更多工具
 
 核心原则：
@@ -136,6 +136,7 @@ qq-deepseek-bot/
 │   ├── qqbot.js
 │   ├── deepseek.js
 │   ├── memory.js
+│   ├── reminders.js
 │   ├── health.js
 │   ├── storage.js
 │   └── tools.js
@@ -285,10 +286,10 @@ Qgent 本地工具定义与执行层。
 - 查询笔记
 - 添加小确幸
 - 查询小确幸
+- 创建、查询和取消一次性提醒
 
 未来：
 
-- Reminder
 - Todo
 - Weather structured API
 - Calendar
@@ -544,44 +545,14 @@ user_id
 
 ---
 
-## 12. Reminder / 主动提醒（下一阶段）
+## 12. 一次性提醒
 
-提醒是下一阶段高优先级能力。
+`src/reminders.js` 负责提醒时间解析、定时扫描和发送结果处理。`src/storage.js` 管理 SQLite 的 `reminders` 表和状态变更。使用单进程调度，重启时从数据库恢复。每日、每周、每月和条件提醒属于后续规划。
 
-建议实现：
-
-```text
-reminders
-```
-
-SQLite 表。
-
-字段至少考虑：
-
-```text
-id
-user_id
-content
-trigger_at
-timezone
-status
-created_at
-```
-
-第一阶段只做：
-
-- 一次性提醒
-
-之后再扩展：
-
-- 每日
-- 每周
-- 每月
-- 条件提醒
-
-提醒发送必须遵守 QQ 官方主动消息能力和额度限制。
-
-不要假设机器人可以无限主动推送。
+- 单聊和群聊的主动消息权限与额度以现行平台文档为准。[QQ 消息收发概述](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)
+- 接收目标只取自创建时的入站事件。读写工具按用户和会话隔离，群里创建的提醒发回原群。
+- 登记后反馈编号、时间和发送地点。QQ 返回消息 ID 后才可宣称平台已受理。
+- 仅对明确的限流拒绝做有限重试。结果不确定时保留可查询的状态，避免重复发送。
 
 ---
 
@@ -1011,7 +982,7 @@ AGENTS.md 如果架构规则发生变化也应同步更新。
 
 ### P1
 
-主动提醒：
+一次性提醒已实现，当前账号的发送权限和实际接收效果待实机验收。
 
 - 一次性 Reminder
 - SQLite Reminder 表

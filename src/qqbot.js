@@ -20,7 +20,7 @@ function conversationKey(msg) {
 
 async function sendReply(bot, qqConfig, msg, content) {
   if ((msg.kind === "c2c" || msg.kind === "group") && msg.replyTarget) {
-    return bot.sendText(msg.replyTarget, content);
+    return bot.sendText({ ...msg.replyTarget, msgId: msg.messageId }, content);
   }
 
   const creds = { appId: qqConfig.appId, clientSecret: qqConfig.appSecret };
@@ -54,7 +54,10 @@ function balanceAuthorized(qqConfig, msg) {
 
 function savedStatus(results) {
   if (!results.length) return "没有查到已成功保存的工具记录。";
-  const labels = { qgent_add_note: "笔记", qgent_add_ledger: "账目", qgent_add_moment: "小确幸" };
+  const labels = {
+    qgent_add_note: "笔记", qgent_add_ledger: "账目", qgent_add_moment: "小确幸",
+    qgent_create_reminder: "登记提醒", qgent_cancel_reminder: "取消提醒",
+  };
   return "已保存：" + results.map((item) => `${labels[item.name] || "记录"} #${item.id}`).join("、") + "。可直接查询核对，不要重复提交。";
 }
 
@@ -62,7 +65,8 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
   const bot = botFactory({
     appId: qqConfig.appId,
     appSecret: qqConfig.appSecret,
-    logger: console,
+    // SDK debug logs include the full HTTP request and response bodies.
+    logger: { info: console.info, warn: console.warn, error: console.error },
     markdownSupport: false,
   });
 
@@ -115,19 +119,19 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
       return;
     }
     if (text === "/status") {
-      await replyCommand(savedStatus(store?.getWriteReceipts(msg.senderId) ?? []));
+      await replyCommand(savedStatus(store?.getWriteReceipts(msg.senderId, null, key) ?? []));
       return;
     }
 
     if (text === "/reset") {
       memory.clear(key);
-      await replyCommand("这段聊天上下文清空啦。持久化的笔记、账本和小确幸不会被删掉喔。");
+      await replyCommand("这段聊天上下文清空啦。笔记、账本、小确幸和提醒都还在。");
       return;
     }
 
     if (text === "/help") {
       await replyCommand(
-        "我是 Qgent ✨ 可以陪你聊天、联网查实时信息，也能真正保存笔记、记账和小确幸。/status 查看最近保存结果。私聊发送 /balance 可以查询 DeepSeek API 余额；/reset 只清空临时聊天上下文。",
+        "我是 Qgent ✨ 可以陪你聊天、查实时信息、记笔记、记账和保存小确幸。私聊或群聊里可以说“明天下午三点在这里提醒我取快递”“查看我的提醒”或“取消提醒 #3”。群里创建的提醒会发到原群。/status 查看最近保存结果，私聊 /balance 查余额，/reset 清空临时聊天上下文。",
       );
       return;
     }
@@ -168,11 +172,16 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
       }
 
       const history = memory.get(key);
+      let reminderTarget;
+      if (msg.kind === "c2c") reminderTarget = { scope: "c2c", targetId: msg.senderId };
+      if (msg.kind === "group" && msg.groupOpenid) reminderTarget = { scope: "group", targetId: msg.groupOpenid };
       const answer = await ai.chat({
         history,
         prompt: text,
         userId: msg.senderId,
         requestId,
+        reminderTarget,
+        messageTimestamp: msg.timestamp,
       });
       // Save before sending: QQ failures must never rerun a completed write.
       store?.saveMessageResult(msg.senderId, requestId, answer);

@@ -1,4 +1,50 @@
+import { ReminderInputError } from "./reminders.js";
+
+const reminderId = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "提醒编号" };
+
+const reminderTools = [
+  {
+    type: "function",
+    name: "qgent_create_reminder",
+    description: "应用户明确请求，在当前 QQ 会话安排一次性提醒。时间或内容不明确时先询问。返回 pending 表示已登记等待发送。",
+    parameters: {
+      type: "object",
+      properties: {
+        content: { type: "string", minLength: 1, maxLength: 500, description: "用户要提醒的事项" },
+        trigger_at: { type: "string", maxLength: 29, description: "指定时区的当地日期和时间 YYYY-MM-DDTHH:mm[:ss]，也接受以 Z 结尾的 UTC 时间。时钟回拨出现两个相同时间时按用户确认附上当地 UTC 偏移，如 -04:00。" },
+        timezone: { type: "string", minLength: 1, maxLength: 80, description: "IANA 时区，如 Asia/Shanghai。省略时使用机器人的配置时区。" },
+      },
+      required: ["content", "trigger_at"], additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "qgent_list_reminders",
+    description: "查询本人在当前 QQ 会话的提醒，待发送的按到期顺序优先显示。可按编号或状态查看发送、取消和失败结果。",
+    parameters: {
+      type: "object",
+      properties: {
+        id: reminderId,
+        status: { type: "string", enum: ["pending", "sending", "sent", "cancelled", "expired", "failed", "unknown"] },
+        limit: { type: "integer", minimum: 1, maximum: 30 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    type: "function",
+    name: "qgent_cancel_reminder",
+    description: "用户明确要求取消时，按编号取消本人在当前会话的一条待发送提醒。目标不明确时先查询，让用户选择。",
+    parameters: {
+      type: "object", properties: { id: reminderId }, required: ["id"], additionalProperties: false,
+    },
+  },
+];
+
+export const reminderToolNames = new Set(reminderTools.map((tool) => tool.name));
+
 export const qgentTools = [
+  ...reminderTools,
   {
     type: "function",
     name: "qgent_get_weather",
@@ -144,16 +190,18 @@ export const qgentTools = [
   },
 ];
 
-export const writeToolNames = new Set(["qgent_add_note", "qgent_add_ledger", "qgent_add_moment"]);
+export const writeToolNames = new Set([
+  "qgent_add_note", "qgent_add_ledger", "qgent_add_moment", "qgent_create_reminder", "qgent_cancel_reminder",
+]);
 
 // A separate key permits two intentionally identical records in one message.
 for (const tool of qgentTools) {
   const limits = { title: 120, query: 500, category: 80, note: 500,
     content: tool.name === "qgent_add_moment" ? 3000 : 5000 };
   for (const [field, maximum] of Object.entries(limits)) {
-    if (tool.parameters.properties[field]) tool.parameters.properties[field].maxLength = maximum;
+    if (tool.parameters.properties[field]) tool.parameters.properties[field].maxLength ??= maximum;
   }
-  if (writeToolNames.has(tool.name)) {
+  if (writeToolNames.has(tool.name) && tool.name !== "qgent_cancel_reminder") {
     tool.parameters.properties.record_key = {
       type: "string", maxLength: 80,
       description: "同一消息确实包含多条完全相同的记录时，分别使用不同编号；重试同一条必须保持编号不变。通常省略。",
@@ -163,7 +211,7 @@ for (const tool of qgentTools) {
 
 function validateValue(value, schema, field) {
   if (schema.type === "string" && (typeof value !== "string" ||
-      value.length > (schema.maxLength ?? 5000))) throw new Error(`${field} 必须是长度合适的文本`);
+      value.length < (schema.minLength ?? 0) || value.length > (schema.maxLength ?? 5000))) throw new Error(`${field} 必须是长度合适的文本`);
   if (schema.type === "number" && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
     throw new Error(`${field} 必须是大于 0 的数字`);
   }
@@ -204,7 +252,7 @@ function parseArgs(raw, tool) {
 }
 
 /** Execute a validated tool in the authenticated QQ user's context. */
-export async function executeQgentTool({ call, userId, store, weather, requestId, signal }) {
+export async function executeQgentTool({ call, userId, store, weather, requestId, signal, reminderTarget }) {
   signal?.throwIfAborted();
   if (typeof userId !== "string" || !userId.trim()) throw new Error("缺少用户标识，不能读写私人数据");
   const tool = qgentTools.find((item) => item.name === call.name);
@@ -215,13 +263,21 @@ export async function executeQgentTool({ call, userId, store, weather, requestId
     return weather.getWeather(args, { signal });
   }
   if (!store) throw new Error("Qgent persistent store is not configured");
+  if (reminderToolNames.has(call.name)) {
+    if (!["c2c", "group"].includes(reminderTarget?.scope) ||
+        typeof reminderTarget.targetId !== "string" || !reminderTarget.targetId.trim() ||
+        (reminderTarget.scope === "c2c" && reminderTarget.targetId !== userId)) {
+      throw new ReminderInputError("请在接收提醒的 QQ 单聊或群聊中操作。");
+    }
+  }
   const methods = {
     qgent_add_note: "addNote", qgent_search_notes: "searchNotes",
     qgent_add_ledger: "addLedgerEntry", qgent_ledger_summary: "ledgerSummary",
     qgent_list_ledger: "listLedger", qgent_add_moment: "addMoment",
     qgent_list_moments: "listMoments",
+    qgent_create_reminder: "addReminder", qgent_list_reminders: "listReminders", qgent_cancel_reminder: "cancelReminder",
   };
-  const execute = () => store[methods[call.name]](userId, args);
+  const execute = () => store[methods[call.name]](userId, args, reminderTarget);
   if (requestId && writeToolNames.has(call.name)) {
     return store.executeWriteOnce(userId, requestId, call.name, args, execute);
   }

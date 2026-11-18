@@ -1,5 +1,6 @@
 import OpenAI from "openai";
-import { executeQgentTool, qgentTools } from "./tools.js";
+import { executeQgentTool, qgentTools, reminderToolNames } from "./tools.js";
+import { ReminderInputError } from "./reminders.js";
 
 function extractOutputText(response) {
   if (typeof response?.output_text === "string" && response.output_text.trim()) {
@@ -27,7 +28,7 @@ function functionCalls(response) {
   return (response?.output ?? []).filter((item) => item?.type === "function_call");
 }
 
-function currentTimeText(timeZone) {
+function messageTimeFormatter(timeZone) {
   try {
     return new Intl.DateTimeFormat("zh-CN", {
       timeZone,
@@ -37,10 +38,11 @@ function currentTimeText(timeZone) {
       weekday: "long",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hour12: false,
-    }).format(new Date());
+    });
   } catch {
-    return new Date().toISOString();
+    return null;
   }
 }
 
@@ -63,6 +65,7 @@ export class DeepSeekClient {
     this.webSearchEnabled = webSearchEnabled;
     this.defaultLocation = defaultLocation;
     this.timeZone = timeZone;
+    this.timeFormatter = messageTimeFormatter(timeZone);
     this.maxToolRounds = maxToolRounds;
     this.store = store;
     this.weather = weather;
@@ -85,17 +88,29 @@ export class DeepSeekClient {
     });
   }
 
-  #instructions() {
-    return `${this.baseInstructions}\n\n【当前时间】${currentTimeText(this.timeZone)}（时区 ${this.timeZone}）。涉及“今天、昨天、本月”等相对日期时以此为准。`;
+  #instructions(reminderTarget, messageTimestamp) {
+    let reminderPrompt = "当前会话无法设置或查询提醒。需要提醒时请用户在 QQ 单聊或目标群聊中提出。";
+    if (reminderTarget) {
+      const destination = reminderTarget.scope === "group"
+        ? "提醒发到当前群，群成员都能看到。发送地点有歧义时先确认，用户要求私下提醒时请转到私聊设置。"
+        : "提醒发到当前私聊。";
+      reminderPrompt = destination + "用户明确请求时调用一次性提醒工具。时间、时区、事项或取消对象有歧义时先问清。周期性请求不能当作一次性提醒处理。"
+        + "仅在对应工具返回 success=true 后确认创建或取消。创建后反馈编号、当地日期时间、时区和发送地点。"
+        + "pending 表示已登记，到时会尝试发送。sent 表示 QQ 已受理，unknown 表示结果未确认。发送受接收方开关、权限及额度影响。";
+    }
+    const sentAt = Date.parse(messageTimestamp);
+    const date = Number.isFinite(sentAt) ? new Date(sentAt) : new Date();
+    const referenceTime = this.timeFormatter?.format(date) ?? date.toISOString();
+    return `${this.baseInstructions}\n\n【提醒】${reminderPrompt}\n\n【本条消息时间】${referenceTime}（时区 ${this.timeZone}）。涉及“明天、几分钟后”等相对时间时以此为准。`;
   }
 
-  #tools() {
-    const tools = [...qgentTools];
+  #tools(reminderTarget) {
+    const tools = qgentTools.filter((tool) => reminderTarget || !reminderToolNames.has(tool.name));
     if (this.webSearchEnabled) tools.push({ type: "web_search" });
     return tools;
   }
 
-  async chat({ history, prompt, userId, requestId }) {
+  async chat({ history, prompt, userId, requestId, reminderTarget, messageTimestamp }) {
     const controller = new AbortController();
     const deadline = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => controller.abort(new Error("AI 总处理超时")), this.timeoutMs);
@@ -119,7 +134,8 @@ export class DeepSeekClient {
       } finally { signal.removeEventListener("abort", abort); }
     };
     try {
-      return await this.runChat({ history, prompt, userId, requestId, signal, wait, check });
+      const instructions = this.#instructions(reminderTarget, messageTimestamp);
+      return await this.runChat({ history, prompt, userId, requestId, reminderTarget, instructions, signal, wait, check });
     } catch (error) {
       // Receipts survive both total timeout and a failed final API response.
       const failure = new Error(`AI 处理未完成: ${error.message}`, { cause: error });
@@ -128,7 +144,7 @@ export class DeepSeekClient {
     } finally { clearTimeout(timer); }
   }
 
-  async runChat({ history, prompt, userId, requestId, signal, wait, check }) {
+  async runChat({ history, prompt, userId, requestId, reminderTarget, instructions, signal, wait, check }) {
     let input = [
       ...history,
       { role: "user", content: prompt },
@@ -137,13 +153,14 @@ export class DeepSeekClient {
     let totalWebSearchCalls = 0;
     let localToolCalls = 0;
     let finalResponse = null;
+    const tools = this.#tools(reminderTarget);
 
     for (let round = 0; round < this.maxToolRounds; round += 1) {
       const response = await wait(() => this.client.responses.create({
         model: this.model,
-        instructions: this.#instructions(),
+        instructions,
         input,
-        tools: this.#tools(),
+        tools,
         tool_choice: "auto",
         stream: false,
       }, { signal, timeout: Math.max(1, this.timeoutMs) }));
@@ -174,11 +191,11 @@ export class DeepSeekClient {
         localToolCalls += 1;
         let result;
         try {
-          result = await wait(() => executeQgentTool({ call, userId, requestId, signal, store: this.store, weather: this.weather }));
+          result = await wait(() => executeQgentTool({ call, userId, requestId, reminderTarget, signal, store: this.store, weather: this.weather }));
           console.log(`[tool] user=${userId} name=${call.name} success=${result?.success === true}`);
         } catch (error) {
           check();
-          result = { success: false, error: "工具执行失败，请检查参数或稍后查询确认。" };
+          result = { success: false, error: error instanceof ReminderInputError ? error.message : "工具执行失败，请检查参数或稍后查询确认。" };
           console.error(`[tool] user=${userId} name=${qgentTools.some((tool) => tool.name === call.name) ? call.name : "unknown"} success=false`, { name: error?.name });
         }
 

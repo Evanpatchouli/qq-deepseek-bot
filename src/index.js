@@ -6,6 +6,7 @@ import { WeatherClient } from "./weather.js";
 import { QgentStore } from "./storage.js";
 import { startHealthServer } from "./health.js";
 import { createQQBot } from "./qqbot.js";
+import { runReminderScheduler } from "./reminders.js";
 
 const state = {
   ready: false,
@@ -40,6 +41,12 @@ const healthServer = startHealthServer({
 });
 
 const abortController = new AbortController();
+const reminderLoop = runReminderScheduler({
+  store,
+  send: (target, content) => bot.sendText(target, content),
+  isReady: () => state.ready,
+  signal: abortController.signal,
+});
 let shuttingDown = false;
 
 async function shutdown(signal) {
@@ -48,8 +55,6 @@ async function shutdown(signal) {
   console.log(`[app] ${signal}, shutting down...`);
   state.ready = false;
   abortController.abort();
-  healthServer.close();
-  store.close();
 }
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
@@ -67,6 +72,8 @@ try {
   process.exitCode = 1;
 } finally {
   clearInterval(cleanupTimer);
+  abortController.abort();
+  await reminderLoop;
   healthServer.close();
   store.close();
 }

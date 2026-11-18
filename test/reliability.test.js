@@ -233,6 +233,77 @@ test("redelivered reset cannot erase newer conversation turns", async (t) => {
   assert.equal(h.memory.get("c2c:a").length, 2);
 });
 
+test("QQ reminders use the inbound conversation through the AI loop, survive reset and report cancellation", async (t) => {
+  const client = aiClient();
+  const h = harness(t, (input) => client.chat(input));
+  client.store = h.store;
+  const actions = {
+    "记提醒": ["qgent_create_reminder", { content: "取快递", trigger_at: "2099-01-02T15:00" }],
+    "看提醒": ["qgent_list_reminders", {}],
+    "取消提醒": ["qgent_cancel_reminder", { id: 1 }],
+    "时间有误": ["qgent_create_reminder", { content: "取快递", trigger_at: "2000-01-01T15:00" }],
+  };
+  const results = [];
+  client.client.responses.create = async ({ input, instructions, tools }) => {
+    const last = input.at(-1);
+    if (last.type === "function_call_output") {
+      results.push(JSON.parse(last.output));
+      return { output_text: "工具返回结果已收到" };
+    }
+    if (last.content === "频道消息") {
+      assert.ok(!tools.some((tool) => tool.name === "qgent_create_reminder"));
+      assert.match(instructions, /当前会话无法/);
+      return { output_text: "请在私聊设置提醒" };
+    }
+    assert.ok(tools.some((tool) => tool.name === "qgent_create_reminder"));
+    assert.ok(tools.some((tool) => tool.type === "web_search"));
+    if (last.content === "记提醒") assert.match(instructions, /15:12:34/);
+    const [name, args] = actions[last.content];
+    return { output: [{ type: "function_call", call_id: "reminder", name, arguments: JSON.stringify(args) }] };
+  };
+  const sendGroup = (id, text, sender = "a") => h.send(h.message(id, text, sender, { kind: "group", groupOpenid: "g", timestamp: "2099-01-01T15:12:34+08:00",
+    replyTarget: { scope: "group", targetId: "g", msgId: id } }));
+  await sendGroup("m1", "记提醒");
+  await sendGroup("m1", "记提醒");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].scope, "group");
+  assert.equal(results[0].timezone, "Asia/Shanghai");
+  assert.equal(results[0].trigger_at, "2099-01-02T07:00:00.000Z");
+  assert.deepEqual(h.replies.at(-1).target, { scope: "group", targetId: "g", msgId: "m1" });
+  await sendGroup("m2", "/reset");
+  await sendGroup("m3", "看提醒");
+  assert.equal(results.at(-1).reminders[0].status, "pending");
+  await sendGroup("m4", "看提醒", "b");
+  assert.equal(results.at(-1).count, 0);
+  await h.send(h.message("private", "看提醒"));
+  assert.equal(results.at(-1).count, 0);
+  await sendGroup("m5", "取消提醒");
+  assert.equal(results.at(-1).status, "cancelled");
+  await sendGroup("m6", "/status");
+  assert.match(h.replies.at(-1).content, /取消提醒 #1/);
+  assert.match(h.replies.at(-1).content, /登记提醒 #1/);
+  await h.send(h.message("private-status", "/status"));
+  assert.doesNotMatch(h.replies.at(-1).content, /#1/);
+  await sendGroup("m7", "时间有误");
+  assert.equal(results.at(-1).success, false);
+  assert.match(results.at(-1).error, /时间已过/);
+  h.bot.messageApi = { sendChannelMessage: async (args) => h.replies.push(args) };
+  await h.send(h.message("guild", "频道消息", "a", { kind: "guild", channelId: "channel" }));
+  assert.equal(h.replies.at(-1).content, "请在私聊设置提醒");
+});
+
+test("a reminder tool loop hits the total round limit without creating duplicate reminders", async (t) => {
+  const store = database(t);
+  const client = aiClient({ store, maxToolRounds: 2 });
+  let requests = 0;
+  client.client.responses.create = async () => ({ output: [{ type: "function_call", call_id: String(++requests),
+    name: "qgent_create_reminder", arguments: '{"content":"取快递","trigger_at":"2099-01-02T15:00"}' }] });
+  const target = { scope: "c2c", targetId: "a" };
+  await assert.rejects(client.chat({ history: [], prompt: "提醒我", userId: "a", requestId: "m", reminderTarget: target }), /round limit/);
+  assert.equal(requests, 2);
+  assert.equal(store.listReminders("a", {}, target).count, 1);
+});
+
 test("tool execution failures reach AI without private error details", async () => {
   const client = aiClient({ store: { addNote: () => { throw new Error("SQLITE_BUSY private data"); } } });
   let requests = 0;
