@@ -2,6 +2,8 @@
 
 基于腾讯 QQ 开放平台新版 Node.js SDK `@tencent-connect/qqbot-nodejs` + DeepSeek API 构建的 AI 机器人后台服务。
 
+QQ Bot Node.js SDK（`@tencent-connect/qqbot-nodejs`）及其文档仅提供接入参考；具体功能、接口约束、权限和额度以 [QQ 开放平台官方文档](https://bot.q.qq.com/wiki/)为准。SDK 提供某个方法不代表平台当前开放对应能力。
+
 机器人默认名称为 **Qgent**，定位为一个运行在 QQ 中的个人生活 AI 助手：可以聊天、联网调查、查询天气、辅助穿搭，并通过本地 SQLite 持久化记录笔记、账目和生活小确幸。
 
 ## 功能

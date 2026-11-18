@@ -53,6 +53,8 @@ Qgent 主要服务个人日常生活场景，包括但不限于：
 @tencent-connect/qqbot-nodejs
 ```
 
+SDK 及其文档仅提供接入参考；具体功能、接口约束、权限和额度以 [QQ 开放平台官方文档](https://bot.q.qq.com/wiki/)为准。不得仅凭 SDK 提供某个方法就认定平台当前开放对应能力；资料冲突时以官方文档为准。
+
 主要使用：
 
 - WebSocket Gateway
