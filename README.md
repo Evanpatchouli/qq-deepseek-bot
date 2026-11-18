@@ -33,6 +33,8 @@
 
 > `/reset` 只会清空临时聊天上下文，不会删除账本、笔记或小确幸等持久化数据。
 
+提醒能力尚未实现。2026-11-05 核查的 [QQ 官方文档](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md)声明，主动推送自 2025-04-21 起停止提供；当前不能承诺“明天到点主动发 QQ 提醒”。SDK 中的主动发送接口及文档中的历史额度不代表当前账号具备发送权限。后续范围和替代方案见 [ROADMAP.md](ROADMAP.md)。
+
 ---
 
 ## 1. 前置要求
