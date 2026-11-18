@@ -6,6 +6,7 @@ import {
 } from "@tencent-connect/qqbot-nodejs";
 import { createMessageQueue } from "./message-queue.js";
 import { formatDeepSeekBalance } from "./balance.js";
+import { RecordInputError, recordLabel, RecordTurn, savedStatus } from "./records.js";
 
 function conversationKey(msg) {
   if (msg.kind === "c2c") return `c2c:${msg.senderId}`;
@@ -52,15 +53,6 @@ function balanceAuthorized(qqConfig, msg) {
   return allowed.length === 0 || allowed.includes(msg.senderId);
 }
 
-function savedStatus(results) {
-  if (!results.length) return "没有查到已成功保存的工具记录。";
-  const labels = {
-    qgent_add_note: "笔记", qgent_add_ledger: "账目", qgent_add_moment: "小确幸",
-    qgent_create_reminder: "登记提醒", qgent_cancel_reminder: "取消提醒",
-  };
-  return "已保存：" + results.map((item) => `${labels[item.name] || "记录"} #${item.id}`).join("、") + "。可直接查询核对，不要重复提交。";
-}
-
 export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.store, botFactory = (options) => new QQBot(options) }) {
   const bot = botFactory({
     appId: qqConfig.appId,
@@ -104,18 +96,23 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
 
     const key = conversationKey(msg);
     const requestId = `${key}:message:${msg.messageId}`;
+    const replyWithoutNewReferences = (content) => {
+      // An older replay or a command can show different IDs from the last AI turn.
+      memory.clearRecordReferences(key, requestId);
+      return sendReply(bot, qqConfig, msg, content);
+    };
     const replyCommand = async (content) => {
       store?.saveMessageResult(msg.senderId, requestId, content);
-      return sendReply(bot, qqConfig, msg, content);
+      return replyWithoutNewReferences(content);
     };
     const cached = store?.getMessageResult(msg.senderId, requestId);
     if (cached) {
-      await sendReply(bot, qqConfig, msg, cached);
+      await replyWithoutNewReferences(cached);
       return;
     }
     const receipts = store?.getWriteReceipts(msg.senderId, requestId) ?? [];
     if (receipts.length) {
-      await sendReply(bot, qqConfig, msg, `${savedStatus(receipts)} 上次处理未完整结束。`);
+      await replyWithoutNewReferences(`${savedStatus(receipts)} 上次处理未完整结束。`);
       return;
     }
     if (text === "/status") {
@@ -131,7 +128,7 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
 
     if (text === "/help") {
       await replyCommand(
-        "我是 Qgent ✨ 可以陪你聊天、查实时信息、记笔记、记账和保存小确幸。私聊或群聊里可以说“明天下午三点在这里提醒我取快递”“查看我的提醒”或“取消提醒 #3”。群里创建的提醒会发到原群。/status 查看最近保存结果，私聊 /balance 查余额，/reset 清空临时聊天上下文。",
+        "我是 Qgent ✨ 可以陪你聊天、查实时信息、记笔记、记账和保存小确幸。可以说“把账目 #3 改为 18 元”“给笔记 #2 加一句带上发票”或“删除小确幸 #1”，删除前会请你确认。私聊或群聊里可以说“明天下午三点在这里提醒我取快递”“查看我的提醒”或“取消提醒 #3”。群里创建的提醒会发到原群。/status 查看最近操作，私聊 /balance 查余额，/reset 清空临时聊天上下文。",
       );
       return;
     }
@@ -167,11 +164,33 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
 
     const startedAt = Date.now();
     try {
+      const lastRecords = memory.getRecordState(key);
+      const confirmation = /^确认删除(?:\s+([a-z0-9]+))?$/iu.exec(text.normalize("NFKC"));
+      if (confirmation) {
+        const pending = lastRecords?.deletion;
+        let answer;
+        try {
+          if (!pending || pending.code !== confirmation[1]?.toLowerCase()) {
+            throw new RecordInputError("没有匹配的删除确认，请在原会话复制预览中的完整确认指令，或重新发起删除。");
+          }
+          const result = store.confirmRecordDeletion(msg.senderId, requestId, pending);
+          answer = `已删除${recordLabel(result.kind, result.id)}。`;
+          memory.appendTurn(key, "确认删除" + recordLabel(result.kind, result.id), answer);
+          console.log(`[tool] user=${msg.senderId} name=qgent_delete_record kind=${result.kind} id=${result.id} success=true`);
+        } catch (error) {
+          console.error(`[tool] user=${msg.senderId} name=qgent_delete_record success=false`, { name: error?.name });
+          if (!(error instanceof RecordInputError)) throw error;
+          answer = error.message;
+        }
+        await replyCommand(answer);
+        return;
+      }
       if (msg.kind === "c2c" && msg.replyTarget) {
         bot.sendTyping(msg.replyTarget, 20).catch(() => {});
       }
 
       const history = memory.get(key);
+      const recordTurn = new RecordTurn(text, lastRecords?.references);
       let reminderTarget;
       if (msg.kind === "c2c") reminderTarget = { scope: "c2c", targetId: msg.senderId };
       if (msg.kind === "group" && msg.groupOpenid) reminderTarget = { scope: "group", targetId: msg.groupOpenid };
@@ -180,12 +199,13 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
         prompt: text,
         userId: msg.senderId,
         requestId,
+        recordTurn,
         reminderTarget,
         messageTimestamp: msg.timestamp,
       });
       // Save before sending: QQ failures must never rerun a completed write.
       store?.saveMessageResult(msg.senderId, requestId, answer);
-      memory.appendTurn(key, text, answer);
+      memory.appendTurn(key, text, answer, { ...recordTurn.state, requestId });
       await sendReply(bot, qqConfig, msg, answer);
 
       state.messagesProcessed += 1;
@@ -195,6 +215,7 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
       );
     } catch (error) {
       state.lastError = error?.name || "Error";
+      memory.clearRecordReferences(key);
       console.error("[message] failed", { name: error?.name, status: error?.status });
       try {
         const saved = store?.getWriteReceipts(msg.senderId, requestId) ?? error.savedResults ?? [];

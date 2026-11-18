@@ -1,4 +1,5 @@
 import { ReminderInputError } from "./reminders.js";
+import { describeRecord, prepareDeletionTool, RecordInputError, recordLabel, recordLabels, updateTools } from "./records.js";
 
 const reminderId = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "提醒编号" };
 
@@ -190,8 +191,39 @@ export const qgentTools = [
   },
 ];
 
+const recordId = { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "该类型的稳定记录编号" };
+const recordReference = {
+  type: "object", properties: { kind: { type: "string", enum: Object.keys(recordLabels) }, id: recordId },
+  required: ["kind", "id"], additionalProperties: false,
+};
+qgentTools.push({
+  type: "function", name: "qgent_get_record", description: "按记录类型与编号读取本人的完整账目、笔记或小确幸。", parameters: recordReference,
+}, {
+  type: "function", name: prepareDeletionTool, description: "用户要求删除或撤销一条已保存的记录时，先展示该记录并请求本人确认。", parameters: recordReference,
+});
+
+for (const [name, kind] of Object.entries(updateTools)) {
+  const add = qgentTools.find((tool) => tool.name === "qgent_add_" + kind);
+  const properties = { id: recordId, ...add.parameters.properties };
+  if (kind === "ledger") {
+    properties.category = { type: "string", description: "用户要求更正的分类" };
+    properties.expected_amount = { type: "number", exclusiveMinimum: 0, description: "用户明确提及的原金额。与当前账目不符时停止修改。" };
+  }
+  if (properties.occurred_on) properties.occurred_on = { type: "string", description: "更正后的日期 YYYY-MM-DD" };
+  if (properties.content) properties.append_content = {
+    type: "string", minLength: 1, maxLength: kind === "note" ? 5000 : 3000,
+    description: "在现有正文后换行追加的原文。追加时只传此字段，替换正文时只传 content。",
+  };
+  qgentTools.push({
+    type: "function", name,
+    description: `按明确编号更正本人的一条${recordLabels[kind]}。只传用户要求修改的字段，省略的字段保留原值。目标有歧义时先查询并让用户选择。`,
+    parameters: { type: "object", properties, required: ["id"], minProperties: 2, additionalProperties: false },
+  });
+}
+
+const createTools = new Set(["qgent_add_note", "qgent_add_ledger", "qgent_add_moment", "qgent_create_reminder"]);
 export const writeToolNames = new Set([
-  "qgent_add_note", "qgent_add_ledger", "qgent_add_moment", "qgent_create_reminder", "qgent_cancel_reminder",
+  ...createTools, "qgent_cancel_reminder", ...Object.keys(updateTools),
 ]);
 
 // A separate key permits two intentionally identical records in one message.
@@ -201,7 +233,7 @@ for (const tool of qgentTools) {
   for (const [field, maximum] of Object.entries(limits)) {
     if (tool.parameters.properties[field]) tool.parameters.properties[field].maxLength ??= maximum;
   }
-  if (writeToolNames.has(tool.name) && tool.name !== "qgent_cancel_reminder") {
+  if (createTools.has(tool.name)) {
     tool.parameters.properties.record_key = {
       type: "string", maxLength: 80,
       description: "同一消息确实包含多条完全相同的记录时，分别使用不同编号；重试同一条必须保持编号不变。通常省略。",
@@ -223,7 +255,7 @@ function validateValue(value, schema, field) {
     for (const item of value) validateValue(item, schema.items, field);
   }
   if (schema.enum && !schema.enum.includes(value)) throw new Error(`${field} 不是允许的值`);
-  if (["content", "city"].includes(field) && !value.trim()) throw new Error(`${field} 不能为空`);
+  if (["content", "append_content", "city"].includes(field) && !value.trim()) throw new Error(`${field} 不能为空`);
   if (["occurred_on", "start_date", "end_date"].includes(field)) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(value) ||
         !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value) {
@@ -243,16 +275,49 @@ function parseArgs(raw, tool) {
   for (const [key, item] of Object.entries(value)) {
     if (!Object.hasOwn(schema.properties, key)) throw new Error(`不支持的工具参数 ${key}`);
     validateValue(item, schema.properties[key], key);
-    if (key === "amount" && (!Number.isSafeInteger(Math.round(item * 100)) || Math.round(item * 100) <= 0)) {
-      throw new Error("金额超出允许范围或不足一分");
+    if (key === "amount" || key === "expected_amount") {
+      const cents = Math.round(item * 100);
+      if (!Number.isSafeInteger(cents) || cents <= 0) throw new Error("金额超出允许范围或不足一分");
+      if (Object.hasOwn(updateTools, tool.name) && cents / 100 !== item) throw new RecordInputError("金额最多保留两位小数。");
     }
   }
   if (value.start_date && value.end_date && value.start_date > value.end_date) throw new Error("开始日期不能晚于结束日期");
+  if (Object.hasOwn(updateTools, tool.name)) {
+    if (!Object.keys(value).some((key) => key !== "id" && key !== "expected_amount")) throw new RecordInputError("请说明要修改的字段。");
+    if (value.content !== undefined && value.append_content !== undefined) throw new RecordInputError("请指定追加或替换正文。");
+  }
   return value;
 }
 
+function requestRecordChoice(store, userId, kind, turn) {
+  const known = [...(turn?.previous ?? []), ...(turn?.state.references ?? [])].filter((ref) => ref.kind === kind);
+  const rowsById = new Map();
+  for (const id of new Set(known.map((ref) => ref.id))) {
+    if (rowsById.size >= 10) break;
+    try {
+      rowsById.set(id, store.getRecord(userId, { kind, id }).record);
+    } catch (error) {
+      if (!(error instanceof RecordInputError)) throw error;
+    }
+  }
+  if (rowsById.size < 2) {
+    let rows;
+    if (kind === "ledger") rows = store.listLedger(userId, { period: "all", limit: 5 }).entries;
+    if (kind === "note") rows = store.searchNotes(userId, { limit: 5 }).notes;
+    if (kind === "moment") rows = store.listMoments(userId, { limit: 5 }).moments;
+    for (const row of rows) rowsById.set(row.id, row);
+  }
+  if (!rowsById.size) return `没有查到你的${recordLabels[kind]}记录。`;
+  const choices = [];
+  for (const row of rowsById.values()) {
+    choices.push(describeRecord(kind, row));
+    turn?.observe("qgent_get_record", { kind, id: row.id });
+  }
+  return `请选定一条记录，回复类型和编号（例如“${recordLabel(kind, rowsById.keys().next().value)}”）再继续。\n` + choices.join("\n");
+}
+
 /** Execute a validated tool in the authenticated QQ user's context. */
-export async function executeQgentTool({ call, userId, store, weather, requestId, signal, reminderTarget }) {
+export async function executeQgentTool({ call, userId, store, weather, requestId, signal, reminderTarget, recordTurn }) {
   signal?.throwIfAborted();
   if (typeof userId !== "string" || !userId.trim()) throw new Error("缺少用户标识，不能读写私人数据");
   const tool = qgentTools.find((item) => item.name === call.name);
@@ -263,6 +328,13 @@ export async function executeQgentTool({ call, userId, store, weather, requestId
     return weather.getWeather(args, { signal });
   }
   if (!store) throw new Error("Qgent persistent store is not configured");
+  const isUpdate = Object.hasOwn(updateTools, call.name);
+  if (isUpdate || call.name === prepareDeletionTool) {
+    const kind = isUpdate ? updateTools[call.name] : args.kind;
+    if (!recordTurn?.allows(kind, args.id)) throw new RecordInputError(requestRecordChoice(store, userId, kind, recordTurn));
+    if (!isUpdate) return store.prepareRecordDeletion(userId, args);
+    return store.updateRecord(userId, requestId, kind, args);
+  }
   if (reminderToolNames.has(call.name)) {
     if (!["c2c", "group"].includes(reminderTarget?.scope) ||
         typeof reminderTarget.targetId !== "string" || !reminderTarget.targetId.trim() ||
@@ -271,6 +343,7 @@ export async function executeQgentTool({ call, userId, store, weather, requestId
     }
   }
   const methods = {
+    qgent_get_record: "getRecord",
     qgent_add_note: "addNote", qgent_search_notes: "searchNotes",
     qgent_add_ledger: "addLedgerEntry", qgent_ledger_summary: "ledgerSummary",
     qgent_list_ledger: "listLedger", qgent_add_moment: "addMoment",

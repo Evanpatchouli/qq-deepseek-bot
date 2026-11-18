@@ -3,8 +3,21 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ReminderInputError, reminderLocalTime, reminderTimestamp } from "./reminders.js";
+import { RecordInputError } from "./records.js";
 
 const DATABASE_TIMEOUT_MS = 5000;
+// SQL identifiers come exclusively from this allowlist. All record values are bound.
+const recordTables = {
+  ledger: { table: "ledger", columns: "id, entry_type AS type, amount_minor, currency, category, note, occurred_on, created_at" },
+  note: { table: "notes", columns: "id, title, content, tags, created_at" },
+  moment: { table: "moments", columns: "id, content, occurred_on, created_at" },
+};
+
+function publicRecord(kind, row) {
+  if (kind !== "ledger") return row;
+  const { amount_minor, ...record } = row;
+  return { ...record, amount: amount_minor / 100 };
+}
 
 function openDatabase(dbPath, options) {
   return new DatabaseSync(dbPath, options);
@@ -487,6 +500,73 @@ export class QgentStore {
     `).all(userId, safeLimit);
 
     return { success: true, count: rows.length, moments: rows };
+  }
+
+  #recordRow(userId, kind, id) {
+    if (!Object.hasOwn(recordTables, kind) || !Number.isSafeInteger(id) || id < 1) {
+      throw new RecordInputError("请提供记录类型和有效编号。");
+    }
+    const { table, columns } = recordTables[kind];
+    const row = this.db.prepare(`SELECT ${columns} FROM ${table} WHERE user_id = ? AND id = ?`).get(userId, id);
+    if (!row) throw new RecordInputError("你的记录中没有这个编号，请重新查询。");
+    return row;
+  }
+
+  getRecord(userId, { kind, id }) {
+    return { success: true, kind, id, record: publicRecord(kind, this.#recordRow(userId, kind, id)) };
+  }
+
+  updateRecord(userId, requestId, kind, changes) {
+    if (!requestId) throw new RecordInputError("缺少来源消息，请重新发送修改请求。");
+    return this.executeWriteOnce(userId, requestId, "qgent_update_" + kind, changes, () => this.#editRecord(userId, kind, changes));
+  }
+
+  #editRecord(userId, kind, changes) {
+    const { id, amount, category, note, occurred_on, type, content, append_content, title, tags } = changes;
+    const current = this.#recordRow(userId, kind, id);
+    let updated;
+    if (kind === "ledger") {
+      if (changes.expected_amount !== undefined && Math.round(changes.expected_amount * 100) !== current.amount_minor) {
+        throw new RecordInputError("所说的原金额与这笔账目不符，请按编号查看后再修改。");
+      }
+      const cents = amount === undefined ? current.amount_minor : Math.round(amount * 100);
+      const newCategory = category === undefined ? current.category : category.trim() || "其他";
+      updated = this.db.prepare(`UPDATE ledger SET entry_type = ?, amount_minor = ?, category = ?, note = ?, occurred_on = ?
+        WHERE user_id = ? AND id = ?`).run(type ?? current.type, cents, newCategory,
+        note?.trim() ?? current.note, occurred_on ?? current.occurred_on, userId, id);
+    } else {
+      const nextContent = append_content === undefined ? content?.trim() : current.content + "\n" + append_content.trim();
+      if (nextContent?.length > (kind === "note" ? 5000 : 3000)) throw new RecordInputError("修改后内容过长，请缩短后再试。");
+      if (kind === "note") {
+        const nextTags = tags === undefined ? undefined : normalizeTags(tags);
+        if (nextTags?.length > 300) throw new RecordInputError("标签合计不能超过 300 个字符。");
+        updated = this.db.prepare("UPDATE notes SET content = ?, title = ?, tags = ? WHERE user_id = ? AND id = ?")
+          .run(nextContent ?? current.content, title?.trim() ?? current.title, nextTags ?? current.tags, userId, id);
+      } else {
+        updated = this.db.prepare("UPDATE moments SET content = ?, occurred_on = ? WHERE user_id = ? AND id = ?")
+          .run(nextContent ?? current.content, occurred_on ?? current.occurred_on, userId, id);
+      }
+    }
+    if (updated.changes !== 1) throw new RecordInputError("修改未生效，请重新查询记录。");
+    return this.getRecord(userId, { kind, id });
+  }
+
+  prepareRecordDeletion(userId, { kind, id }) {
+    const row = this.#recordRow(userId, kind, id);
+    const fingerprint = createHash("sha256").update(JSON.stringify(row)).digest("hex");
+    return { success: true, kind, id, record: publicRecord(kind, row), fingerprint };
+  }
+
+  confirmRecordDeletion(userId, requestId, { kind, id, fingerprint, expiresAt }) {
+    return this.executeWriteOnce(userId, requestId, "qgent_delete_record", { kind, id }, () => {
+      if (!Number.isFinite(expiresAt) || Date.now() >= expiresAt) throw new RecordInputError("删除确认已过期，请重新查看要删除的记录。");
+      if (this.prepareRecordDeletion(userId, { kind, id }).fingerprint !== fingerprint) {
+        throw new RecordInputError("记录在预览后已修改，请重新查看并确认删除。");
+      }
+      const result = this.db.prepare(`DELETE FROM ${recordTables[kind].table} WHERE user_id = ? AND id = ?`).run(userId, id);
+      if (result.changes !== 1) throw new RecordInputError("删除未生效，请重新查询记录。");
+      return { success: true, kind, id };
+    });
   }
 
   addReminder(userId, { content, trigger_at, timezone = this.timeZone }, target) {

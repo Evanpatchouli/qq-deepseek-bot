@@ -6,19 +6,29 @@ export class ConversationMemory {
     this.ttlMs = ttlMs;
   }
 
-  get(key) {
+  #entry(key) {
     const item = this.#store.get(key);
-    if (!item) return [];
-
-    if (Date.now() - item.updatedAt > this.ttlMs) {
+    if (item && Date.now() - item.updatedAt > this.ttlMs) {
       this.#store.delete(key);
-      return [];
+      return;
     }
-
-    return item.messages.map((message) => ({ ...message }));
+    return item;
   }
 
-  appendTurn(key, userContent, assistantContent) {
+  get(key) {
+    return this.#entry(key)?.messages.map((message) => ({ ...message })) ?? [];
+  }
+
+  getRecordState(key) {
+    return this.#entry(key)?.recordState;
+  }
+
+  clearRecordReferences(key, keepRequestId) {
+    const state = this.getRecordState(key);
+    if (state && state.requestId !== keepRequestId) state.references = [];
+  }
+
+  appendTurn(key, userContent, assistantContent, recordState) {
     const messages = this.get(key);
     messages.push(
       { role: "user", content: userContent },
@@ -28,6 +38,7 @@ export class ConversationMemory {
     this.#store.set(key, {
       messages: messages.slice(-this.maxMessages),
       updatedAt: Date.now(),
+      recordState,
     });
   }
 

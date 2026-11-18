@@ -349,3 +349,150 @@ test("total AI budget does not reset between response requests", async () => {
   assert.equal(requests, 2);
   assert.equal(secondSignal.aborted, true);
 });
+
+function recordBot(t, actions) {
+  const client = aiClient();
+  const h = harness(t, (input) => client.chat(input));
+  client.store = h.store;
+  const outputs = [];
+  client.client.responses.create = async ({ input }) => {
+    const last = input.at(-1);
+    if (last.type === "function_call_output") {
+      outputs.push(JSON.parse(last.output));
+      return { output_text: "处理完毕" };
+    }
+    const [name, args] = actions[last.content];
+    return { output: [{ type: "function_call", call_id: "record", name, arguments: JSON.stringify(args) }] };
+  };
+  const say = async (id, content, sender = "a", extra) => {
+    await h.send(h.message(id, content, sender, extra));
+    return h.replies.at(-1)?.content;
+  };
+  return { ...h, say, outputs };
+}
+
+test("QQ uses verified record IDs across turns, asks before ambiguous edits and reports failed writes truthfully", async (t) => {
+  const h = recordBot(t, {
+    "午饭 28 元记一下": ["qgent_add_ledger", { type: "expense", amount: 28 }],
+    "刚才那笔不是 28，是 18": ["qgent_update_ledger", { id: 1, expected_amount: 28, amount: 18 }],
+    "查看笔记": ["qgent_search_notes", {}],
+    "那条笔记加一句带上发票": ["qgent_update_note", { id: 1, append_content: "带上发票" }],
+    "笔记 #2": ["qgent_update_note", { id: 2, append_content: "带上发票" }],
+    "改笔记 #99": ["qgent_update_note", { id: 99, content: "错" }],
+    "查看笔记 #2": ["qgent_get_record", { kind: "note", id: 2 }],
+  });
+  h.store.addNote("a", { content: "报销交通费" });
+  h.store.addNote("a", { content: "报销住宿费" });
+  h.store.addNote("b", { content: "其他用户的秘密" });
+  assert.match(await h.say("1", "午饭 28 元记一下"), /已保存账目 #1/);
+  assert.match(await h.say("2", "刚才那笔不是 28，是 18"), /已修改账目 #1/);
+  assert.equal(h.outputs.at(-1).record.amount, 18);
+  assert.equal(h.store.ledgerSummary("a").expense, 18);
+  await h.say("3", "查看笔记");
+  const choice = await h.say("4", "那条笔记加一句带上发票");
+  assert.match(choice, /请选定/);
+  assert.match(choice, /笔记 #1.*报销交通费/);
+  assert.match(choice, /笔记 #2.*报销住宿费/);
+  assert.doesNotMatch(choice, /秘密|已修改/);
+  assert.equal(h.store.getWriteReceipts("a", "c2c:a:message:4").length, 0);
+  const changed = await h.say("5", "笔记 #2");
+  assert.match(changed, /已修改笔记 #2/);
+  assert.equal(await h.say("5", "笔记 #2"), changed);
+  await h.say("6", "/reset");
+  await h.say("7", "查看笔记 #2");
+  assert.equal(h.outputs.at(-1).record.content, "报销住宿费\n带上发票");
+  assert.equal(h.store.getRecord("a", { kind: "note", id: 1 }).record.content, "报销交通费");
+  assert.match(await h.say("8", "改笔记 #99"), /没有这个编号/);
+  assert.match(await h.say("9", "/status"), /修改笔记 #2/);
+});
+
+test("QQ deletion requires a fresh user message matching the owner's preview in the same conversation", async (t) => {
+  const h = recordBot(t, {
+    "撤销小确幸 #1": ["qgent_prepare_record_deletion", { kind: "moment", id: 1 }],
+    "把小确幸 #1 改成晴天": ["qgent_update_moment", { id: 1, content: "晴天" }],
+  });
+  h.store.addMoment("a", { content: "晚霞" });
+  const group = { kind: "group", groupOpenid: "g", replyTarget: { scope: "group", targetId: "g" } };
+  const otherGroup = { ...group, groupOpenid: "g2", replyTarget: { scope: "group", targetId: "g2" } };
+  const preview = async (id, expectedContent) => {
+    const text = await h.say(id, "撤销小确幸 #1", "a", group);
+    assert.match(text, /待删除的记录/);
+    assert.ok(text.includes(expectedContent));
+    assert.equal(h.store.listMoments("a").count, 1);
+    return text.match(/确认删除 [a-f0-9]{8}/u)[0];
+  };
+  const first = await preview("p1", "晚霞");
+  assert.match(await h.say("wrong-user", first, "b", group), /没有匹配/);
+  assert.match(await h.say("wrong-qq", first), /没有匹配/);
+  assert.match(await h.say("wrong-group", first, "a", otherGroup), /没有匹配/);
+  assert.match(await h.say("guess", "确认删除", "a", group), /没有匹配/);
+  await h.say("edit", "把小确幸 #1 改成晴天");
+  assert.match(await h.say("changed", first, "a", group), /预览后已修改/);
+  const second = await preview("p2", "晴天");
+  await h.say("reset", "/reset", "a", group);
+  assert.match(await h.say("after-reset", second, "a", group), /没有匹配/);
+  assert.equal(h.store.listMoments("a").count, 1);
+  const final = await preview("p3", "晴天");
+  assert.match(await h.say("delete", final, "a", group), /已删除小确幸 #1/);
+  assert.equal(await h.say("delete", final, "a", group), "已删除小确幸 #1。");
+  assert.match(await h.say("repeat", final, "a", group), /没有匹配/);
+  assert.equal(h.store.listMoments("a").count, 0);
+  assert.equal(h.store.getWriteReceipts("a", "group:g:user:a:message:delete").length, 1);
+  assert.match(await h.say("status", "/status", "a", group), /删除小确幸 #1/);
+});
+
+test("exhausting an edit tool loop leaves one durable append and an accurate QQ fallback", async (t) => {
+  const client = aiClient({ maxToolRounds: 3 });
+  const h = harness(t, (input) => client.chat(input));
+  client.store = h.store;
+  h.store.addNote("a", { content: "报销" });
+  let rounds = 0;
+  client.client.responses.create = async () => ({ output: [{ type: "function_call", call_id: String(++rounds),
+    name: "qgent_update_note", arguments: '{"id":1,"append_content":"发票"}' }] });
+  const message = h.message("edit", "笔记 #1 加一句发票");
+  await h.send(message);
+  assert.equal(rounds, 3);
+  assert.match(h.replies.at(-1).content, /未完整完成.*修改笔记 #1/);
+  await h.send(message);
+  assert.equal(rounds, 3);
+  assert.match(h.replies.at(-1).content, /修改笔记 #1/);
+  assert.equal(h.store.searchNotes("a").notes[0].content, "报销\n发票");
+});
+
+test("a status reply or an older QQ replay cannot silently retarget the next relative edit", async (t) => {
+  const h = recordBot(t, {
+    "记笔记 1": ["qgent_add_note", { content: "第一条" }],
+    "记笔记 2": ["qgent_add_note", { content: "第二条" }],
+    "查看笔记 #2": ["qgent_get_record", { kind: "note", id: 2 }],
+    "那条笔记加一句": ["qgent_update_note", { id: 2, append_content: "追加" }],
+  });
+  await h.say("1", "记笔记 1");
+  await h.say("2", "记笔记 2");
+  await h.say("2", "记笔记 2");
+  assert.match(await h.say("3", "那条笔记加一句"), /已修改笔记 #2/);
+  await h.say("status", "/status");
+  assert.match(await h.say("4", "那条笔记加一句"), /请选定/);
+  await h.say("5", "查看笔记 #2");
+  await h.say("1", "记笔记 1");
+  assert.match(await h.say("6", "那条笔记加一句"), /请选定/);
+  assert.equal(h.store.getRecord("a", { kind: "note", id: 2 }).record.content, "第二条\n追加");
+});
+
+test("a delete preview reports earlier committed writes and stops the rest of a mixed tool batch", async (t) => {
+  const store = database(t);
+  store.addNote("a", { content: "旧的清单" });
+  const client = aiClient({ store });
+  const actions = [
+    ["qgent_create_reminder", { content: "买牛奶", trigger_at: "2099-01-02T15:00" }],
+    ["qgent_prepare_record_deletion", { kind: "note", id: 1 }],
+    ["qgent_add_note", { content: "后续请求" }],
+  ];
+  client.client.responses.create = async () => ({ output: actions.map(([name, args], i) =>
+    ({ type: "function_call", call_id: String(i), name, arguments: JSON.stringify(args) })) });
+  const reply = await client.chat({ history: [], prompt: "提醒我买牛奶，再撤销笔记 #1。", userId: "a", requestId: "m",
+    reminderTarget: { scope: "c2c", targetId: "a" } });
+  assert.match(reply, /待删除的记录/);
+  assert.match(reply, /登记提醒 #1/);
+  assert.match(reply, /后续操作尚未执行/);
+  assert.equal(store.searchNotes("a").count, 1);
+});
