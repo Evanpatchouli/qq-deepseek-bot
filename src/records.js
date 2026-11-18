@@ -19,15 +19,19 @@ export function recordLabel(kind, id) {
 
 export function savedStatus(results) {
   if (!results.length) return "没有查到已完成的记录操作。";
-  const entries = results.map(({ name, kind, id }) => {
+  const entries = results.map(({ name, kind, id, preference }) => {
     if (Object.hasOwn(addedKinds, name)) return "保存" + recordLabel(addedKinds[name], id);
     if (Object.hasOwn(updateTools, name)) return "修改" + recordLabel(updateTools[name], id);
     if (name === "qgent_delete_record") return "删除" + recordLabel(kind, id);
     if (name === "qgent_create_reminder") return `登记提醒 #${id}`;
     if (name === "qgent_cancel_reminder") return `取消提醒 #${id}`;
+    if (name === "qgent_set_preference") return `保存偏好「${preference}」`;
+    if (name === "qgent_delete_preference") return `删除偏好「${preference}」`;
+    if (name === "qgent_subscribe_weather") return "开启或更新天气订阅";
+    if (name === "qgent_cancel_weather_subscription") return "取消天气订阅";
     return `记录 #${id}`;
   });
-  return "已执行的操作包括" + entries.join("、") + "。可按编号核对。";
+  return "已执行的操作包括" + entries.join("、") + "。" + (results.some(({ id }) => id) ? "可按编号核对。" : "");
 }
 
 function excerpt(value, length) {
@@ -75,6 +79,11 @@ export class RecordTurn {
   }
 
   observe(name, result) {
+    if (name === "qgent_life_review") {
+      for (const row of result.notes?.records ?? []) this.observe("qgent_get_record", { kind: "note", id: row.id });
+      for (const row of result.moments?.records ?? []) this.observe("qgent_get_record", { kind: "moment", id: row.id });
+      return;
+    }
     const list = listedKinds[name];
     const kind = list?.[0] ?? addedKinds[name] ?? updateTools[name] ??
       ((name === "qgent_get_record" || name === prepareDeletionTool) ? result.kind : undefined);

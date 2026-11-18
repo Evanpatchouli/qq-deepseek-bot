@@ -7,6 +7,7 @@ import { QgentStore } from "./storage.js";
 import { startHealthServer } from "./health.js";
 import { createQQBot } from "./qqbot.js";
 import { runReminderScheduler } from "./reminders.js";
+import { runWeatherScheduler } from "./weather-subscriptions.js";
 
 const state = {
   ready: false,
@@ -47,6 +48,7 @@ const reminderLoop = runReminderScheduler({
   isReady: () => state.ready,
   signal: abortController.signal,
 });
+const weatherLoop = runWeatherScheduler({ store, weather, isReady: () => state.ready, signal: abortController.signal });
 let shuttingDown = false;
 
 async function shutdown(signal) {
@@ -73,7 +75,7 @@ try {
 } finally {
   clearInterval(cleanupTimer);
   abortController.abort();
-  await reminderLoop;
+  await Promise.all([reminderLoop, weatherLoop]);
   healthServer.close();
   store.close();
 }

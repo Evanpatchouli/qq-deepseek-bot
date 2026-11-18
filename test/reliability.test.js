@@ -22,7 +22,7 @@ const deferred = () => { let resolve; const promise = new Promise((r) => { resol
 function aiClient(options = {}) {
   return new DeepSeekClient({ apiKey: "fake", model: "fake", systemPrompt: "test", timeoutMs: 1000, ...options });
 }
-function harness(t, chat) {
+function harness(t, chat, aiOptions = {}) {
   const store = database(t);
   const memory = new ConversationMemory();
   const handlers = {};
@@ -31,7 +31,7 @@ function harness(t, chat) {
   const bot = { use: (fn) => middleware.push(fn), on: (event, fn) => { handlers[event] = fn; },
     sendText: async (target, content) => { replies.push({ target, content }); }, sendTyping: async () => {} };
   createQQBot({ qqConfig: { appId: "test", appSecret: "fake", groupRequireMention: true, balanceAllowedOpenIds: ["a"] },
-    ai: { chat, store }, memory, state: { messagesProcessed: 0 }, botFactory: () => bot });
+    ai: { chat, store, ...aiOptions }, memory, state: { messagesProcessed: 0 }, botFactory: () => bot });
   const message = (id, content, senderId = "a", extra = {}) => ({ kind: "c2c", senderId, messageId: id, content,
     replyTarget: { targetId: senderId, scope: "c2c" }, ...extra });
   return { store, memory, bot, replies, middleware, message, send: (msg) => handlers.message({}, msg) };
@@ -231,6 +231,61 @@ test("redelivered reset cannot erase newer conversation turns", async (t) => {
   await h.send(h.message("next", "hello"));
   await h.send(h.message("reset", "/reset"));
   assert.equal(h.memory.get("c2c:a").length, 2);
+});
+
+test("QQ manages only explicitly requested preferences, including reset, delete and redelivery", async (t) => {
+  const h = harness(t, async () => "临时讨论");
+  const say = (id, text, sender) => h.send(h.message(id, text, sender));
+  await say("trip", "我今天到了杭州");
+  assert.deepEqual(h.store.listPreferences("a").preferences, []);
+  await say("p1", "记住我的城市是杭州");
+  await say("p2", "把我的城市改为西安");
+  await say("p1", "记住我的城市是杭州");
+  assert.equal(h.store.preferenceValue("a", "城市"), "西安");
+  await say("p3", "记住我的穿衣偏好是亚麻面料");
+  await say("p4", "/prefs 时区 America/New_York");
+  await say("reset", "/reset");
+  assert.deepEqual(h.memory.get("c2c:a"), []);
+  await say("list", "查看我的偏好");
+  assert.match(h.replies.at(-1).content, /亚麻面料/);
+  assert.match(h.replies.at(-1).content, /西安/);
+  assert.equal(h.store.addReminder("a", { content: "取件", trigger_at: "2099-01-11T10:00" },
+    { scope: "c2c", targetId: "a" }).timezone, "America/New_York");
+  await say("list", "/prefs", "b");
+  assert.doesNotMatch(h.replies.at(-1).content, /亚麻面料|西安/);
+  await say("p5", "忘记我的城市");
+  await say("p6", "/prefs 删除 穿衣");
+  assert.equal(h.store.preferenceValue("a", "城市"), undefined);
+  await say("p7", "/prefs 时区 Oops/Bad");
+  assert.match(h.replies.at(-1).content, /IANA/);
+  assert.equal(h.store.userTimeZone("a"), "America/New_York");
+  await say("status", "/status");
+  assert.match(h.replies.at(-1).content, /删除偏好「穿衣」/);
+  assert.doesNotMatch(h.replies.at(-1).content, /undefined|亚麻面料/);
+});
+
+test("weather subscription requires an inbound private opt-in and can be inspected or stopped without AI", async (t) => {
+  const h = harness(t, async () => "请在私聊发送 /weather on 08:00 杭州", { weather: { apiKey: "test" } });
+  const say = (id, text, sender) => h.send(h.message(id, text, sender));
+  await say("ask", "以后每天的天气怎么样");
+  await h.send(h.message("group-sub", "/weather on 08:00 上海", "a", { kind: "group", groupOpenid: "g" }));
+  assert.match(h.replies.at(-1).content, /私聊/);
+  assert.equal(h.store.getWeatherSubscription("a"), undefined);
+  await say("p", "/prefs 城市 杭州");
+  await say("sub", "/weather on 08:00");
+  assert.match(h.replies.at(-1).content, /已订阅 杭州/);
+  await say("reset", "/reset");
+  await say("view", "/weather");
+  assert.match(h.replies.at(-1).content, /下次检查/);
+  await say("other", "/weather off", "b");
+  assert.ok(h.store.getWeatherSubscription("a").next_check_at);
+  await h.send(h.message("group-status", "/status", "a", { kind: "group", groupOpenid: "g" }));
+  assert.doesNotMatch(h.replies.at(-1).content, /订阅|偏好/);
+  await say("off", "/weather off");
+  await say("sub", "/weather on 08:00");
+  assert.equal(h.store.getWeatherSubscription("a").next_check_at, null);
+  await say("check", "/weather");
+  assert.match(h.replies.at(-1).content, /当前没有天气订阅/);
 });
 
 test("QQ reminders use the inbound conversation through the AI loop, survive reset and report cancellation", async (t) => {

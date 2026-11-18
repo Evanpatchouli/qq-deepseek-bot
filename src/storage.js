@@ -4,6 +4,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { ReminderInputError, reminderLocalTime, reminderTimestamp } from "./reminders.js";
 import { RecordInputError } from "./records.js";
+import { dateRange, isCalendarDate, localDate, noteTimeBounds } from "./dates.js";
+import { checkCity, checkPreference, checkPreferenceName, PreferenceInputError } from "./preferences.js";
+import { nextWeatherCheck, weatherCheckWindow } from "./weather-subscriptions.js";
 
 const DATABASE_TIMEOUT_MS = 5000;
 // SQL identifiers come exclusively from this allowlist. All record values are bound.
@@ -42,46 +45,9 @@ function storageInitializationError(dbPath, error) {
   );
 }
 
-function localDateParts(timeZone, date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(date);
-
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-  return {
-    year: Number(values.year),
-    month: Number(values.month),
-    day: Number(values.day),
-  };
-}
-
-function dateString(year, month, day) {
-  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-function todayIn(timeZone) {
-  const { year, month, day } = localDateParts(timeZone);
-  return dateString(year, month, day);
-}
-
-function monthRange(timeZone, offset = 0) {
-  const { year, month } = localDateParts(timeZone);
-  const anchor = new Date(Date.UTC(year, month - 1 + offset, 1));
-  const y = anchor.getUTCFullYear();
-  const m = anchor.getUTCMonth() + 1;
-  const endAnchor = new Date(Date.UTC(y, m, 0));
-  return {
-    start: dateString(y, m, 1),
-    end: dateString(y, m, endAnchor.getUTCDate()),
-  };
-}
-
 function assertDate(value, field) {
   if (value == null || value === "") return null;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+  if (!isCalendarDate(value)) {
     throw new Error(`${field} must be YYYY-MM-DD`);
   }
   return value;
@@ -171,6 +137,14 @@ export class QgentStore {
 
       CREATE INDEX IF NOT EXISTS idx_notes_user_created
         ON notes(user_id, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_notes_user_timestamp ON notes(user_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS user_preferences (
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (user_id, name)
+      );
 
       CREATE TABLE IF NOT EXISTS ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,6 +193,18 @@ export class QgentStore {
       CREATE INDEX IF NOT EXISTS idx_reminders_owner ON reminders(user_id, scope, target_id);
       CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(status, next_attempt_at);
       CREATE INDEX IF NOT EXISTS idx_reminders_attempts ON reminders(scope, target_id, last_attempt_at);
+      CREATE TABLE IF NOT EXISTS weather_subscriptions (
+        user_id TEXT PRIMARY KEY NOT NULL,
+        city TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        check_time TEXT NOT NULL,
+        next_check_at INTEGER,
+        last_check_at INTEGER,
+        last_result TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        reminder_id INTEGER REFERENCES reminders(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_weather_due ON weather_subscriptions(next_check_at) WHERE next_check_at IS NOT NULL;
     `);
   }
 
@@ -251,7 +237,8 @@ export class QgentStore {
     const rows = requestId
       ? this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ? AND request_id = ? ORDER BY rowid`).all(userId, requestId)
       : this.db.prepare(`SELECT tool_name, result FROM tool_receipts WHERE user_id = ?
-          AND (? IS NULL OR tool_name NOT IN ('qgent_create_reminder', 'qgent_cancel_reminder') OR instr(request_id, ?) = 1)
+          AND (? IS NULL OR tool_name NOT IN ('qgent_create_reminder', 'qgent_cancel_reminder', 'qgent_set_preference',
+              'qgent_delete_preference', 'qgent_subscribe_weather', 'qgent_cancel_weather_subscription') OR instr(request_id, ?) = 1)
           ORDER BY rowid DESC LIMIT 10`).all(userId, prefix, prefix);
     return rows.map((row) => ({ name: row.tool_name, ...JSON.parse(row.result) }));
   }
@@ -271,8 +258,39 @@ export class QgentStore {
     return new Date().toISOString();
   }
 
-  today() {
-    return todayIn(this.timeZone);
+  listPreferences(userId, { name } = {}) {
+    const preferences = name === undefined
+      ? this.db.prepare("SELECT name, value FROM user_preferences WHERE user_id = ? ORDER BY name").all(userId)
+      : this.db.prepare("SELECT name, value FROM user_preferences WHERE user_id = ? AND name = ?").all(userId, checkPreferenceName(name));
+    return { success: true, preferences };
+  }
+
+  preferenceValue(userId, name) {
+    return this.db.prepare("SELECT value FROM user_preferences WHERE user_id = ? AND name = ?").get(userId, name)?.value;
+  }
+
+  userTimeZone(userId) {
+    return this.preferenceValue(userId, "时区") ?? this.timeZone;
+  }
+
+  setPreference(userId, name, value) {
+    const clean = checkPreference(name, value);
+    const result = this.db.prepare(`INSERT INTO user_preferences (user_id, name, value)
+      SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM user_preferences WHERE user_id = ? AND name = ?)
+        OR (SELECT COUNT(*) FROM user_preferences WHERE user_id = ?) < 12
+      ON CONFLICT(user_id, name) DO UPDATE SET value = excluded.value`).run(userId, name, clean, userId, name, userId);
+    if (result.changes !== 1) throw new PreferenceInputError("最多保存 12 项长期偏好，请先删除一项。");
+    return { success: true, preference: name };
+  }
+
+  deletePreference(userId, name) {
+    const result = this.db.prepare("DELETE FROM user_preferences WHERE user_id = ? AND name = ?").run(userId, checkPreferenceName(name));
+    if (!result.changes) throw new PreferenceInputError("没有找到你的这项长期偏好。");
+    return { success: true, preference: name };
+  }
+
+  today(userId, now) {
+    return localDate(userId ? this.userTimeZone(userId) : this.timeZone, now);
   }
 
   addNote(userId, { title = "", content, tags = [] }) {
@@ -332,7 +350,7 @@ export class QgentStore {
     category = "其他",
     note = "",
     occurred_on: occurredOn,
-  }) {
+  }, now) {
     const entryType = type === "income" ? "income" : type === "expense" ? "expense" : null;
     if (!entryType) throw new Error("type 必须是 expense 或 income");
 
@@ -342,7 +360,7 @@ export class QgentStore {
     }
 
     const amountMinor = Math.round(numericAmount * 100);
-    const date = assertDate(occurredOn, "occurred_on") || this.today();
+    const date = assertDate(occurredOn, "occurred_on") || this.today(userId, now);
     const cleanCategory = String(category ?? "其他").trim() || "其他";
     const cleanNote = String(note ?? "").trim();
 
@@ -372,28 +390,8 @@ export class QgentStore {
     };
   }
 
-  #resolveLedgerRange({ period = "this_month", start_date: startDate, end_date: endDate } = {}) {
-    const start = assertDate(startDate, "start_date");
-    const end = assertDate(endDate, "end_date");
-    if (start || end) {
-      return { start: start || "0000-01-01", end: end || "9999-12-31", label: "custom" };
-    }
-
-    if (period === "today") {
-      const today = this.today();
-      return { start: today, end: today, label: "today" };
-    }
-    if (period === "last_month") {
-      return { ...monthRange(this.timeZone, -1), label: "last_month" };
-    }
-    if (period === "all") {
-      return { start: "0000-01-01", end: "9999-12-31", label: "all" };
-    }
-    return { ...monthRange(this.timeZone, 0), label: "this_month" };
-  }
-
-  ledgerSummary(userId, options = {}) {
-    const range = this.#resolveLedgerRange(options);
+  ledgerSummary(userId, options = {}, now) {
+    const range = dateRange(options, this.userTimeZone(userId), now);
     const category = String(options.category ?? "").trim();
     const params = [userId, range.start, range.end];
     let categorySql = "";
@@ -447,8 +445,8 @@ export class QgentStore {
     };
   }
 
-  listLedger(userId, options = {}) {
-    const range = this.#resolveLedgerRange(options);
+  listLedger(userId, options = {}, now) {
+    const range = dateRange(options, this.userTimeZone(userId), now);
     const safeLimit = clampLimit(options.limit, 10, 30);
     const rows = this.db.prepare(`
       SELECT id, entry_type AS type, amount_minor, currency, category, note, occurred_on, created_at
@@ -471,10 +469,10 @@ export class QgentStore {
     };
   }
 
-  addMoment(userId, { content, occurred_on: occurredOn }) {
+  addMoment(userId, { content, occurred_on: occurredOn }, now) {
     const cleanContent = String(content ?? "").trim();
     if (!cleanContent) throw new Error("小确幸内容不能为空");
-    const date = assertDate(occurredOn, "occurred_on") || this.today();
+    const date = assertDate(occurredOn, "occurred_on") || this.today(userId, now);
 
     const result = this.db.prepare(`
       INSERT INTO moments (user_id, content, occurred_on, created_at)
@@ -500,6 +498,39 @@ export class QgentStore {
     `).all(userId, safeLimit);
 
     return { success: true, count: rows.length, moments: rows };
+  }
+
+  lifeReview(userId, { kind = "all", period = "this_week", start_date, end_date, limit = 5 } = {}, now = Date.now()) {
+    const options = { period, start_date, end_date };
+    this.db.exec("BEGIN");
+    try {
+      const timezone = this.userTimeZone(userId);
+      const range = dateRange(options, timezone, now);
+      const review = { success: true, period: range.label, start_date: range.start, end_date: range.end, timezone };
+      if (kind === "all" || kind === "ledger") review.ledger = this.ledgerSummary(userId, options, now);
+      for (const type of ["note", "moment"]) {
+        if (kind !== "all" && kind !== type) continue;
+        const isNote = type === "note";
+        const table = isNote ? "notes" : "moments";
+        const column = isNote ? "created_at" : "occurred_on";
+        const bounds = isNote ? noteTimeBounds(range, timezone) : [range.start, range.end];
+        const where = `FROM ${table} WHERE user_id = ? AND ${column} BETWEEN ? AND ?`;
+        const { total } = this.db.prepare(`SELECT COUNT(*) AS total ${where}`).get(userId, ...bounds);
+        const records = this.db.prepare(`SELECT id, ${isNote ? "title, created_at" : "occurred_on"},
+          substr(content, 1, 240) AS excerpt, length(content) > 240 AS truncated ${where}
+          ORDER BY ${column} DESC, id DESC LIMIT ?`).all(userId, ...bounds, clampLimit(limit, 5, 10));
+        for (const row of records) {
+          if (isNote) row.local_date = localDate(timezone, Date.parse(row.created_at));
+          row.truncated = Boolean(row.truncated);
+        }
+        review[table] = { total, records };
+      }
+      this.db.exec("COMMIT");
+      return review;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   #recordRow(userId, kind, id) {
@@ -569,16 +600,21 @@ export class QgentStore {
     });
   }
 
-  addReminder(userId, { content, trigger_at, timezone = this.timeZone }, target) {
-    const text = content.trim();
-    if (!text || text.length > 500) throw new ReminderInputError("提醒内容应为 1 至 500 个字符。");
-    const triggerAt = reminderTimestamp(trigger_at, timezone, Date.now());
+  #insertReminder(userId, target, text, triggerAt, timezone) {
     const result = this.db.prepare(`
       INSERT INTO reminders (user_id, scope, target_id, content, trigger_at, timezone, created_at, next_attempt_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(userId, target.scope, target.targetId, text, triggerAt, timezone, this.nowIso(), triggerAt);
+    return Number(result.lastInsertRowid);
+  }
+
+  addReminder(userId, { content, trigger_at, timezone = this.userTimeZone(userId) }, target) {
+    const text = content.trim();
+    if (!text || text.length > 500) throw new ReminderInputError("提醒内容应为 1 至 500 个字符。");
+    const triggerAt = reminderTimestamp(trigger_at, timezone, Date.now());
+    const id = this.#insertReminder(userId, target, text, triggerAt, timezone);
     return {
-      success: true, id: Number(result.lastInsertRowid), status: "pending", scope: target.scope,
+      success: true, id, status: "pending", scope: target.scope,
       content: text, trigger_at: new Date(triggerAt).toISOString(), local_time: reminderLocalTime(triggerAt, timezone), timezone,
     };
   }
@@ -604,6 +640,81 @@ export class QgentStore {
     return { success: true, id, status: "cancelled" };
   }
 
+  getWeatherSubscription(userId) {
+    return this.db.prepare(`SELECT s.*, r.status AS delivery, r.detail AS delivery_detail FROM weather_subscriptions s
+      LEFT JOIN reminders r ON r.id = s.reminder_id AND r.user_id = s.user_id AND r.scope = 'c2c'
+      WHERE s.user_id = ?`).get(userId);
+  }
+
+  #cancelQueuedWeather(userId, id) {
+    if (id == null) return;
+    // An in-flight send may still be accepted, but a subsequent 429 must
+    // not re-enqueue it after the subscriber has changed or stopped it.
+    this.db.prepare(`UPDATE reminders SET status = CASE status WHEN 'pending' THEN 'cancelled' ELSE status END,
+      detail = '天气订阅已变更，停止后续发送' WHERE id = ? AND user_id = ? AND scope = 'c2c'
+      AND status IN ('pending', 'sending')`).run(id, userId);
+  }
+
+  // Subscription changes run inside the incoming message's write-receipt transaction.
+  subscribeWeather(userId, { city, check_time }, now = Date.now()) {
+    const location = checkCity(city);
+    const current = this.getWeatherSubscription(userId);
+    const timezone = this.userTimeZone(userId);
+    const next = nextWeatherCheck(now, timezone, check_time, current?.last_check_at);
+    this.#cancelQueuedWeather(userId, current?.reminder_id);
+    this.db.prepare(`INSERT INTO weather_subscriptions (user_id, city, timezone, check_time, next_check_at, last_result)
+      VALUES (?, ?, ?, ?, ?, 'waiting')
+      ON CONFLICT(user_id) DO UPDATE SET city = excluded.city, timezone = excluded.timezone,
+        check_time = excluded.check_time, next_check_at = excluded.next_check_at, last_result = excluded.last_result,
+        revision = revision + 1, reminder_id = NULL`).run(userId, location, timezone, check_time, next);
+    return { success: true, timezone, next_check_at: next };
+  }
+
+  cancelWeatherSubscription(userId) {
+    const current = this.getWeatherSubscription(userId);
+    if (current?.next_check_at == null) throw new PreferenceInputError("当前没有可取消的天气订阅。");
+    this.#cancelQueuedWeather(userId, current.reminder_id);
+    this.db.prepare(`UPDATE weather_subscriptions SET next_check_at = NULL, city = '', timezone = '', check_time = '',
+      reminder_id = NULL, revision = revision + 1, last_result = 'cancelled' WHERE user_id = ?`).run(userId);
+    return { success: true };
+  }
+
+  claimWeatherCheck(now) {
+    const row = this.db.prepare(`SELECT user_id, city, timezone, check_time, next_check_at, last_check_at, revision
+      FROM weather_subscriptions WHERE next_check_at <= ? ORDER BY next_check_at, user_id LIMIT 1`).get(now);
+    if (!row) return;
+    // A long outage can leave an older date at the head of the queue even
+    // while today's check is still within its catch-up window.
+    const scheduled = nextWeatherCheck(now - weatherCheckWindow, row.timezone, row.check_time, row.last_check_at);
+    const inWindow = scheduled <= now && scheduled >= row.next_check_at
+      && localDate(row.timezone, now) === localDate(row.timezone, scheduled);
+    const lastCheck = inWindow ? now : row.next_check_at;
+    const next = nextWeatherCheck(now, row.timezone, row.check_time, lastCheck);
+    const claimed = this.db.prepare(`UPDATE weather_subscriptions SET last_check_at = ?, next_check_at = ?,
+      last_result = 'checking' WHERE user_id = ? AND revision = ? AND next_check_at = ?`)
+      .run(lastCheck, next, row.user_id, row.revision, row.next_check_at);
+    if (claimed.changes === 1) return { ...row, lastCheck, inWindow, scheduled };
+  }
+
+  finishWeatherCheck(claim, { status, content }, now) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare(`UPDATE weather_subscriptions SET last_result = ?
+        WHERE user_id = ? AND revision = ? AND last_check_at = ? AND last_result = 'checking'`)
+        .run(status, claim.user_id, claim.revision, claim.lastCheck);
+      if (result.changes && content) {
+        const target = { scope: "c2c", targetId: claim.user_id };
+        const id = this.#insertReminder(claim.user_id, target, content, now, claim.timezone);
+        this.db.prepare("UPDATE weather_subscriptions SET reminder_id = ? WHERE user_id = ?").run(id, claim.user_id);
+      }
+      this.db.exec("COMMIT");
+      return result.changes === 1;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   // Only the scheduler can claim across owners. A single UPDATE arbitrates
   // between a due send, a concurrent scan and an owner's cancellation.
   claimDueReminder(now, oldestDue, staleSend) {
@@ -626,10 +737,15 @@ export class QgentStore {
   }
 
   finishReminder(id, { status, detail = null, messageId = null, retryAt = null }) {
-    const result = this.db.prepare(`UPDATE reminders SET status = ?, detail = ?, qq_message_id = ?,
+    // The claim clears detail before each attempt. Only a subscription
+    // cancellation or change can set it while a send is in flight.
+    const row = this.db.prepare(`UPDATE reminders SET
+      status = CASE WHEN ? = 'pending' AND detail IS NOT NULL THEN 'cancelled' ELSE ? END,
+      detail = CASE WHEN ? = 'pending' AND detail IS NOT NULL THEN detail ELSE ? END, qq_message_id = ?,
       next_attempt_at = COALESCE(?, next_attempt_at)
-      WHERE id = ? AND status = 'sending'`).run(status, detail, messageId, retryAt, id);
-    if (!result.changes) throw new Error("提醒的发送状态已变更，未写入本次结果");
+      WHERE id = ? AND status = 'sending' RETURNING status`).get(status, status, status, detail, messageId, retryAt, id);
+    if (!row) throw new Error("提醒的发送状态已变更，未写入本次结果");
+    return row.status;
   }
 
   close() {

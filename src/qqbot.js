@@ -7,6 +7,7 @@ import {
 import { createMessageQueue } from "./message-queue.js";
 import { formatDeepSeekBalance } from "./balance.js";
 import { RecordInputError, recordLabel, RecordTurn, savedStatus } from "./records.js";
+import { handlePersonalCommand } from "./preferences.js";
 
 function conversationKey(msg) {
   if (msg.kind === "c2c") return `c2c:${msg.senderId}`;
@@ -122,13 +123,13 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
 
     if (text === "/reset") {
       memory.clear(key);
-      await replyCommand("这段聊天上下文清空啦。笔记、账本、小确幸和提醒都还在。");
+      await replyCommand("这段聊天上下文清空啦。长期偏好、账本、笔记、小确幸、提醒和天气订阅都还在。");
       return;
     }
 
     if (text === "/help") {
       await replyCommand(
-        "我是 Qgent ✨ 可以陪你聊天、查实时信息、记笔记、记账和保存小确幸。可以说“把账目 #3 改为 18 元”“给笔记 #2 加一句带上发票”或“删除小确幸 #1”，删除前会请你确认。私聊或群聊里可以说“明天下午三点在这里提醒我取快递”“查看我的提醒”或“取消提醒 #3”。群里创建的提醒会发到原群。/status 查看最近操作，私聊 /balance 查余额，/reset 清空临时聊天上下文。",
+        "我是 Qgent ✨ 可以陪你聊天、查天气、记笔记、记账和保存小确幸。可以说“回顾我这周的生活”“把账目 #3 改为 18 元”或“删除小确幸 #1”，删除记录前会请你确认。私聊或群聊里可以说“明天下午三点在这里提醒我取快递”“查看我的提醒”或“取消提醒 #3”。群里创建的提醒会发到原群。\n/prefs 查看和管理长期偏好，例如 /prefs 城市 杭州。私聊 /weather 管理天气订阅，/balance 查余额。/status 查看最近操作，/reset 清空临时聊天上下文。",
       );
       return;
     }
@@ -164,6 +165,12 @@ export function createQQBot({ qqConfig, ai, balance, memory, state, store = ai.s
 
     const startedAt = Date.now();
     try {
+      const personalReply = handlePersonalCommand({ text, userId: msg.senderId, requestId, store,
+        isC2C: msg.kind === "c2c", weatherAvailable: Boolean(ai.weather?.apiKey), defaultLocation: ai.defaultLocation });
+      if (personalReply !== null) {
+        await replyCommand(personalReply);
+        return;
+      }
       const lastRecords = memory.getRecordState(key);
       const confirmation = /^确认删除(?:\s+([a-z0-9]+))?$/iu.exec(text.normalize("NFKC"));
       if (confirmation) {

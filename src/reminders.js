@@ -105,8 +105,8 @@ export async function dispatchDueReminder({ store, send, signal, now = Date.now 
     done.abort();
   }
   // Keep a DB failure after submission out of the transport retry path.
-  store.finishReminder(row.id, result);
-  console.log(`[reminder] id=${row.id} attempt=${row.attempts} status=${result.status}`);
+  const status = store.finishReminder(row.id, result);
+  console.log(`[reminder] id=${row.id} attempt=${row.attempts} status=${status}`);
 }
 
 export async function runReminderScheduler({ store, send, isReady, signal }) {
